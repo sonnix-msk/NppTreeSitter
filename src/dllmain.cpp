@@ -1175,6 +1175,9 @@ std::string DetectTreeSitterLanguageForFile(const std::wstring& path, const std:
         // 1C:Enterprise / OneScript (BSL). The grammar ships as tree-sitter-bsl.
         { L"bsl", "bsl" },
         { L"os", "bsl" },
+        // 1C:Enterprise query language (SDBL), standalone documents.
+        { L"sdbl", "sdbl" },
+        { L"1cquery", "sdbl" },
         { L"f", "fortran" },
         { L"for", "fortran" },
         { L"f90", "fortran" },

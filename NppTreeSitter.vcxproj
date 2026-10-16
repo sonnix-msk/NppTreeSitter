@@ -133,6 +133,7 @@
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\TreeSitterLexer.cpp" />
+    <ClCompile Include="src\QueryFragmentScorer.cpp" />
     <!-- tree-sitter core: compile lib.c directly into our DLL -->
     <ClCompile Include="$(TreeSitterDir)\lib\src\lib.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
@@ -143,6 +144,7 @@
   <!-- Header files -->
   <ItemGroup>
     <ClInclude Include="src\TreeSitterLexer.h" />
+    <ClInclude Include="src\QueryFragmentScorer.h" />
   </ItemGroup>
 
   <!-- Version resource -->

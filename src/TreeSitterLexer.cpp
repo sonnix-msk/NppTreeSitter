@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "TreeSitterLexer.h"
+#include "QueryFragmentScorer.h"
 
 #include <tree_sitter/api.h>
 
@@ -32,6 +33,18 @@ const TSStyleInfo kStyleInfo[TSStyle::Count] = {
     { "constant",     "SCE_TS_CONSTANT",     "Constant"               },
     { "punctuation",  "SCE_TS_PUNCTUATION",  "Punctuation"            },
     { "tag",          "SCE_TS_TAG",          "Tag (HTML/XML)"         },
+    // Query-fragment styles (SDBL inside BSL strings). Shown in Style Configurator.
+    { "QUERY KEYWORD",     "SCE_TS_Q_KEYWORD",     "Query keyword"          },
+    { "QUERY IDENTIFIER",  "SCE_TS_Q_IDENTIFIER",  "Query identifier / field" },
+    { "QUERY STRING",      "SCE_TS_Q_STRING",      "Query string literal"   },
+    { "QUERY NUMBER",      "SCE_TS_Q_NUMBER",      "Query number literal"   },
+    { "QUERY AGGREGATE",   "SCE_TS_Q_AGGREGATE",   "Query aggregate fn (СУММА/…)" },
+    { "QUERY OPERATOR",    "SCE_TS_Q_OPERATOR",    "Query operator"         },
+    { "QUERY FUNCTION",    "SCE_TS_Q_FUNCTION",    "Query function / aggregate" },
+    { "QUERY TYPE",        "SCE_TS_Q_TYPE",        "Query type keyword"     },
+    { "QUERY CONSTANT",    "SCE_TS_Q_CONSTANT",    "Query constant (Истина/Ложь/…) " },
+    { "QUERY PARAMETER",   "SCE_TS_Q_PARAMETER",   "Query parameter (&…)"   },
+    { "QUERY PUNCTUATION", "SCE_TS_Q_PUNCTUATION", "Query punctuation"      },
 };
 
 // ============================================================================
@@ -522,6 +535,390 @@ static TSPoint PointAtByte(const char* text, uint32_t len, uint32_t byteOffset)
 }
 
 // ---------------------------------------------------------------------------
+// Query fragments (BSL only): highlight SDBL query text embedded in BSL string
+// literals. Detection is probabilistic - a fragment may be the middle of a query
+// and does not parse as a whole - so the text is scored with features from
+// lexicon.json and, past the threshold, the SDBL grammar is used purely as a
+// colorizer. See docs/QUERY-FRAGMENTS.md.
+// ---------------------------------------------------------------------------
+namespace {
+
+const qf::QueryFragmentScorer& QueryFragmentScorerFor(const std::wstring& grammarDir)
+{
+    static qf::QueryFragmentScorer scorer;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        if (!grammarDir.empty())
+            scorer.LoadFromFileW(grammarDir + L"\\bsl-query-fragments.json");
+    }
+    return scorer;
+}
+
+// Replace double quotes and line-continuation pipes with spaces, keeping the
+// byte length identical so SDBL token offsets map 1:1 back onto the literal.
+std::string MakeSdblInput(const char* raw, size_t len)
+{
+    std::string out(raw, len);
+    size_t lineStart = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const char c = out[i];
+        if (c == '"') {
+            out[i] = ' ';
+        } else if (c == '\n') {
+            lineStart = i + 1;
+        } else if (c == '|') {
+            bool onlyWs = true;
+            for (size_t j = lineStart; j < i; ++j) {
+                if (out[j] != ' ' && out[j] != '\t') { onlyWs = false; break; }
+            }
+            if (onlyWs) out[i] = ' ';  // leading '|' is BSL continuation, not SDBL
+        }
+    }
+    return out;
+}
+
+// Parse `input` with the SDBL grammar and append its highlight captures to
+// `highlights`, offset by `base` (identical offsets thanks to the
+// length-preserving construction of `input`).
+//
+// `literalSpans` are the byte ranges of `input` that correspond to real BSL
+// string text; a capture is only projected when it lies entirely inside one of
+// them (so text over a variable placeholder is never colored).
+//
+// The SDBL grammar defines keywords without word boundaries and gives the
+// identifier token a lower precedence (token(prec(-1, ...))), so a short keyword
+// can win over a longer identifier and split a real word: e.g. "Пометка" becomes
+// BY_KEYWORD "По" + identifier "метка". Such captures are grammar artifacts, not
+// real keywords, so any capture that is only part of a larger word in the source
+// is dropped here (a genuine keyword is always delimited by non-word characters).
+struct ByteSpan {
+    uint32_t start;
+    uint32_t end;
+};
+
+bool IsWordByte(unsigned char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;  // ASCII word or any UTF-8 lead/continuation
+}
+
+// Map an SDBL capture (plus its node type) to the dedicated Query* styles, so a
+// query never reuses the host BSL code colors. `nodeType` is needed because the
+// SDBL query uses @constant.builtin both for real constants (Истина/Ложь/…) and
+// for &parameters; the node type tells them apart. Returns -1 to skip the capture.
+int MapQueryCapture(const std::string& capture, const char* nodeType)
+{
+    auto is = [&](const char* n) { return nodeType && std::strcmp(nodeType, n) == 0; };
+    // Aggregate functions (СУММА/КОЛИЧЕСТВО/СРЕДНЕЕ/МИНИМУМ/МАКСИМУМ) are their
+    // own class; the grammar captures the whole "сумма(" token as this node type.
+    if (is("aggregate_function_name")) return TSStyle::QueryAggregate;
+    // ДАТАВРЕМЯ(...) is captured as a whole @constant literal, but it reads as a
+    // call: skip it so its parts get finer styles (ДАТАВРЕМЯ -> function below,
+    // the numbers -> numbers).
+    if (capture.rfind("constant", 0) == 0 && is("date_time_literal")) return -1;
+    // ПУСТАЯТАБЛИЦА.( … ) is a table constructor, not a plain keyword.
+    if (is("EMPTY_TABLE_KEYWORD")) return TSStyle::QueryFunction;
+    if (capture == "constant.builtin" && is("parameter"))
+        return TSStyle::QueryParameter;
+    if (capture == "comment") return TSStyle::Comment;  // rare inside a query
+    if (capture.rfind("keyword", 0) == 0) return TSStyle::QueryKeyword;
+    if (capture.rfind("type", 0) == 0) return TSStyle::QueryType;
+    if (capture.rfind("constant", 0) == 0) return TSStyle::QueryConstant;
+    if (capture.rfind("variable", 0) == 0) return TSStyle::QueryIdentifier;
+    if (capture.rfind("function", 0) == 0 || capture.rfind("method", 0) == 0)
+        return TSStyle::QueryFunction;
+    if (capture.rfind("operator", 0) == 0) return TSStyle::QueryOperator;
+    if (capture.rfind("punctuation", 0) == 0) return TSStyle::QueryPunctuation;
+    if (capture.rfind("number", 0) == 0 || capture == "float") return TSStyle::QueryNumber;
+    if (capture.rfind("string", 0) == 0 || capture == "character") return TSStyle::QueryString;
+    return TSStyle::QueryIdentifier;
+}
+
+// True if the next non-blank byte after `pos` is '('. This is the rule that
+// classifies call-like words as functions: ДАТАВРЕМЯ(, ТИП(, ЗНАЧЕНИЕ(,
+// ЕСТЬNULL(, ПРЕДСТАВЛЕНИЕ( and any other name followed by a bracket - no need to
+// enumerate them.
+bool FollowedByOpenParen(const std::string& input, size_t pos)
+{
+    while (pos < input.size() && (input[pos] == ' ' || input[pos] == '\t'))
+        ++pos;
+    return pos < input.size() && input[pos] == '(';
+}
+
+// Resolve the query-palette style for one SDBL capture, shared by the fragment
+// pass and by standalone .sdbl documents. Applies the bracket rule (keyword/type/
+// identifier followed by '(' reads as a function) and, for aggregates, splits the
+// trailing '(' off the token so the name is painted and the bracket stays
+// punctuation. Returns the style, or -1 to skip the capture. `paintEnd`/`parenTail`
+// describe what to emit.
+int ResolveQueryStyle(const std::string& capture, const char* nodeType,
+                      const std::string& text, uint32_t cs, uint32_t ce,
+                      uint32_t& paintEnd, bool& parenTail)
+{
+    paintEnd = ce;
+    parenTail = false;
+    int style = MapQueryCapture(capture, nodeType);
+    if (style < 0)
+        return -1;
+    if ((style == TSStyle::QueryKeyword || style == TSStyle::QueryType ||
+         style == TSStyle::QueryIdentifier) && FollowedByOpenParen(text, ce))
+        style = TSStyle::QueryFunction;
+    if (style == TSStyle::QueryAggregate) {
+        while (paintEnd > cs && (text[paintEnd - 1] == '(' || text[paintEnd - 1] == ' ' ||
+                                 text[paintEnd - 1] == '\t'))
+            --paintEnd;
+        parenTail = paintEnd < ce;
+    }
+    return style;
+}
+
+void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>& literalSpans,
+                           uint32_t base, const TreeSitterGrammar* sdblGrammar,
+                           std::vector<LexHighlight>& highlights)
+{
+    TSParser* parser = ts_parser_new();
+    if (!parser)
+        return;
+    ts_parser_set_language(parser, sdblGrammar->GetLanguage());
+    TSTree* tree = ts_parser_parse_string(parser, nullptr, input.c_str(),
+                                          static_cast<uint32_t>(input.size()));
+    if (tree) {
+        const TSQuery* query = sdblGrammar->GetHighlightQuery();
+        TSNode root = ts_tree_root_node(tree);
+        TSQueryCursor* cursor = ts_query_cursor_new();
+        if (cursor) {
+            ts_query_cursor_exec(cursor, query, root);
+            TSQueryMatch match;
+            while (ts_query_cursor_next_match(cursor, &match)) {
+                for (uint16_t i = 0; i < match.capture_count; ++i) {
+                    const TSQueryCapture& cap = match.captures[i];
+                    const uint32_t cs = ts_node_start_byte(cap.node);
+                    const uint32_t ce = ts_node_end_byte(cap.node);
+                    if (cs >= ce || ce > input.size())
+                        continue;
+                    // Project only capturers that fall inside real string text.
+                    bool inLiteral = false;
+                    for (const ByteSpan& sp : literalSpans) {
+                        if (cs >= sp.start && ce <= sp.end) { inLiteral = true; break; }
+                    }
+                    if (!inLiteral)
+                        continue;
+                    // Skip captures that are only a slice of a longer word: both
+                    // the capture's own boundary byte AND its neighbour must be
+                    // word bytes. (A capture ending in "(" followed by a word, as
+                    // the SDBL aggregate name does, is not a slice.)
+                    const bool leftSlice = cs > 0 &&
+                        IsWordByte(static_cast<unsigned char>(input[cs])) &&
+                        IsWordByte(static_cast<unsigned char>(input[cs - 1]));
+                    const bool rightSlice = ce < input.size() &&
+                        IsWordByte(static_cast<unsigned char>(input[ce - 1])) &&
+                        IsWordByte(static_cast<unsigned char>(input[ce]));
+                    if (leftSlice || rightSlice)
+                        continue;
+                    uint32_t nameLen = 0;
+                    const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
+                    uint32_t paintEnd = ce;
+                    bool parenTail = false;
+                    const int style = ResolveQueryStyle(std::string(name, nameLen),
+                                                        ts_node_type(cap.node), input,
+                                                        cs, ce, paintEnd, parenTail);
+                    if (style < 0 || paintEnd <= cs)
+                        continue;
+                    // Same-start overlaps: keywords/functions/… must win over the
+                    // generic identifier capture (e.g. ЕСТЬNULL is both a function
+                    // and a @variable). Keep query highlights on top of the host
+                    // BSL highlights (large pattern = painted later = wins).
+                    const uint32_t prio = (style == TSStyle::QueryIdentifier) ? 1000000u : 1000001u;
+                    highlights.push_back({base + cs, base + paintEnd, static_cast<char>(style), prio});
+                    if (parenTail)
+                        highlights.push_back({base + paintEnd, base + ce,
+                                              TSStyle::QueryPunctuation, prio});
+                }
+            }
+            ts_query_cursor_delete(cursor);
+        }
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
+}
+
+// True when `node` is a binary_expression whose operator is a single '+' byte.
+bool IsPlusBinaryExpression(const char* docText, TSNode node)
+{
+    if (std::strcmp(ts_node_type(node), "binary_expression") != 0)
+        return false;
+    const TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+    if (ts_node_is_null(op))
+        return false;
+    const uint32_t a = ts_node_start_byte(op);
+    const uint32_t b = ts_node_end_byte(op);
+    return b == a + 1 && docText[a] == '+';
+}
+
+// Strip single-child "expression" wrappers (the grammar always wraps operands as
+// (expression ...)), so an operand's real form can be inspected.
+TSNode UnwrapExpression(TSNode node)
+{
+    while (std::strcmp(ts_node_type(node), "expression") == 0) {
+        TSNode only = {};
+        int named = 0;
+        const uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc; ++i) {
+            const TSNode c = ts_node_child(node, i);
+            if (ts_node_is_named(c)) { ++named; only = c; }
+        }
+        if (named != 1)
+            break;
+        node = only;
+    }
+    return node;
+}
+
+// Descend to the underlying leaf: expression -> const_expression -> string.
+TSNode UnwrapToLeaf(TSNode node)
+{
+    while (true) {
+        const char* t = ts_node_type(node);
+        if (std::strcmp(t, "expression") != 0 && std::strcmp(t, "const_expression") != 0)
+            return node;
+        TSNode only = {};
+        int named = 0;
+        const uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc; ++i) {
+            const TSNode c = ts_node_child(node, i);
+            if (ts_node_is_named(c)) { ++named; only = c; }
+        }
+        if (named != 1)
+            return node;
+        node = only;
+    }
+}
+
+// Flatten a chain of '+' binary_expression nodes (left-assoc: a+b+c is (a+b)+c)
+// into the flat list of operand nodes.
+void FlattenConcat(const char* docText, TSNode expr, std::vector<TSNode>& out)
+{
+    const TSNode node = UnwrapExpression(expr);
+    if (IsPlusBinaryExpression(docText, node)) {
+        FlattenConcat(docText, ts_node_child_by_field_name(node, "left", 4), out);
+        FlattenConcat(docText, ts_node_child_by_field_name(node, "right", 5), out);
+    } else if (!ts_node_is_null(expr)) {
+        out.push_back(expr);
+    }
+}
+
+// Handle a whole string-concatenation expression ("a" + X + "b"): score the
+// literal parts as one query fragment, and if it passes, color the SDBL tokens
+// that land on the literal parts (variables become neutral placeholders so the
+// parser keeps its bearings while their positions are skipped on projection).
+void HandleConcatGroup(const char* docText, uint32_t docLen, TSNode group,
+                       const qf::QueryFragmentScorer& scorer, const TreeSitterGrammar* sdbl,
+                       std::vector<LexHighlight>& highlights)
+{
+    std::vector<TSNode> operands;
+    FlattenConcat(docText, group, operands);
+    if (operands.size() < 2)
+        return;
+
+    const uint32_t groupStart = ts_node_start_byte(group);
+    const uint32_t groupEnd = ts_node_end_byte(group);
+    if (groupEnd > docLen || groupEnd <= groupStart)
+        return;
+
+    std::vector<ByteSpan> literalSpans;   // coordinates within the combined text
+    std::string scoreText;
+    for (const TSNode& op : operands) {
+        const TSNode leaf = UnwrapToLeaf(op);
+        if (std::strcmp(ts_node_type(leaf), "string") != 0)
+            continue;
+        const uint32_t s = ts_node_start_byte(leaf);
+        const uint32_t e = ts_node_end_byte(leaf);
+        if (e > docLen)
+            return;
+        literalSpans.push_back({ s - groupStart, e - groupStart });
+        scoreText += MakeSdblInput(docText + s, e - s);
+        scoreText += ' ';
+    }
+    if (literalSpans.empty())
+        return;
+    if (scorer.Score(scoreText).score < scorer.Threshold())
+        return;
+
+    // Build the length-preserving combined input: literal text with quotes/pipes
+    // blanked, a single neutral placeholder per non-literal operand, and spaces
+    // everywhere else (the '+' operators and whitespace between operands).
+    std::string combined(static_cast<size_t>(groupEnd - groupStart), ' ');
+    for (const ByteSpan& sp : literalSpans) {
+        const std::string piece = MakeSdblInput(docText + groupStart + sp.start, sp.end - sp.start);
+        combined.replace(sp.start, sp.end - sp.start, piece);
+    }
+    for (const TSNode& op : operands) {
+        const TSNode leaf = UnwrapToLeaf(op);
+        if (std::strcmp(ts_node_type(leaf), "string") == 0)
+            continue;
+        const uint32_t s = ts_node_start_byte(op) - groupStart;
+        if (s < combined.size() && combined[s] == ' ')
+            combined[s] = 'X';  // neutral identifier / value placeholder
+    }
+
+    AddFragmentHighlights(combined, literalSpans, groupStart, sdbl, highlights);
+}
+
+// Walk the (pruned) tree for string literals and string concatenations, score
+// them, and colorize the ones that look like query fragments.
+void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
+                                TSNode rootNode, uint32_t startPos, uint32_t endPos,
+                                std::vector<LexHighlight>& highlights)
+{
+    TreeSitterRegistry& registry = TreeSitterRegistry::Instance();
+    const qf::QueryFragmentScorer& scorer = QueryFragmentScorerFor(registry.GetGrammarDir());
+    if (!scorer.IsLoaded())
+        return;
+    const TreeSitterGrammar* sdbl = registry.GetGrammarByName("sdbl");
+    if (!sdbl || !sdbl->GetLanguage() || !sdbl->GetHighlightQuery())
+        return;
+
+    std::vector<TSNode> stack;
+    stack.push_back(rootNode);
+    while (!stack.empty()) {
+        const TSNode node = stack.back();
+        stack.pop_back();
+        const uint32_t ns = ts_node_start_byte(node);
+        const uint32_t ne = ts_node_end_byte(node);
+        if (ns > endPos || ne < startPos)
+            continue;  // outside the styled range
+
+        const char* type = ts_node_type(node);
+        if (ts_node_is_named(node) && std::strcmp(type, "string") == 0) {
+            if (ns < docLen && ne <= docLen && ns < ne) {
+                const std::string input = MakeSdblInput(docText + ns, ne - ns);
+                if (scorer.Score(input).score >= scorer.Threshold())
+                    AddFragmentHighlights(input, {{0, static_cast<uint32_t>(input.size())}},
+                                          ns, sdbl, highlights);
+            }
+            continue;  // strings do not nest - no need to descend
+        }
+        if (IsPlusBinaryExpression(docText, node)) {
+            // Handle the whole group once (at its topmost '+'); a nested '+'
+            // is only reached if its parent was not a '+', which cannot happen
+            // here because we never descend into a handled group.
+            const TSNode parent = ts_node_parent(node);
+            if (ts_node_is_null(parent) || !IsPlusBinaryExpression(docText, parent)) {
+                HandleConcatGroup(docText, docLen, node, scorer, sdbl, highlights);
+                continue;  // do not descend: its strings are handled as a group
+            }
+            continue;
+        }
+        const uint32_t childCount = ts_node_child_count(node);
+        for (uint32_t i = 0; i < childCount; ++i)
+            stack.push_back(ts_node_child(node, i));
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Lex() - The core: parse document with tree-sitter, apply Scintilla styles
 // ---------------------------------------------------------------------------
 void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengthDoc,
@@ -739,6 +1136,9 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
     // Key: (startByte << 32 | endByte). Assumes files < 4 GB.
     std::unordered_map<uint64_t, char> nodeHighlightMap;
 
+    // Standalone query documents get the dedicated query palette (see below).
+    const bool isSdblGrammar = (m_grammar->GetName() == "sdbl");
+
     TSQueryMatch match;
     while (ts_query_cursor_next_match(cursor, &match)) {
         if (!EvaluatePredicates(query, match, docText, static_cast<uint32_t>(docLen)))
@@ -753,10 +1153,30 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
                 query, capture.index, &nameLen);
 
             std::string captureName(name, nameLen);
-            char style = m_styleMap.MapCapture(captureName);
 
             uint32_t nodeStart = ts_node_start_byte(node);
             uint32_t nodeEnd = ts_node_end_byte(node);
+
+            // Standalone .sdbl / .1cquery documents: the whole file is a query, so
+            // use the dedicated query palette (same mapping as the fragments inside
+            // BSL strings) instead of the generic code palette.
+            if (isSdblGrammar) {
+                uint32_t paintEnd = nodeEnd;
+                bool parenTail = false;
+                const int qstyle = ResolveQueryStyle(captureName, ts_node_type(node),
+                                                     m_lastText, nodeStart, nodeEnd,
+                                                     paintEnd, parenTail);
+                if (qstyle < 0 || paintEnd <= nodeStart)
+                    continue;
+                const uint32_t prio = static_cast<uint32_t>(match.pattern_index) * 2u +
+                    (qstyle == TSStyle::QueryIdentifier ? 0u : 1u);
+                highlights.push_back({ nodeStart, paintEnd, static_cast<char>(qstyle), prio });
+                if (parenTail)
+                    highlights.push_back({ paintEnd, nodeEnd, TSStyle::QueryPunctuation, prio });
+                continue;
+            }
+
+            char style = m_styleMap.MapCapture(captureName);
 
             if (nodeStart < nodeEnd) {
                 highlights.push_back({ nodeStart, nodeEnd, style, match.pattern_index });
@@ -974,6 +1394,19 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
                 ts_parser_delete(pInjParser);
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 4b: Query fragments inside string literals (BSL only)
+    // ---------------------------------------------------------------
+    // The stock injection mechanism (Step 4) can't be used here: it ignores
+    // query predicates and cannot glue concatenations. Instead we score string
+    // literals with our own detector and colorize the ones that look like SDBL.
+    if (m_grammar->GetName() == "bsl") {
+        AddQueryFragmentHighlights(docText, static_cast<uint32_t>(docLen), rootNode,
+                                   static_cast<uint32_t>(startPos),
+                                   static_cast<uint32_t>(endPos),
+                                   highlights);
     }
 
     // ---------------------------------------------------------------

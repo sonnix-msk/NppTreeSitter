@@ -52,7 +52,24 @@ namespace TSStyle {
         Constant      = 11,
         Punctuation   = 12,
         Tag           = 13,
-        Count         = 14,
+
+        // Extra styles used ONLY for SDBL query fragments embedded in BSL string
+        // literals, so a query reads as a different language instead of reusing
+        // the host code colors. These are emitted only by the query-fragment
+        // pass (never by a normal grammar highlight query).
+        QueryKeyword      = 14,
+        QueryIdentifier   = 15,
+        QueryString       = 16,
+        QueryNumber       = 17,
+        QueryAggregate    = 18,   // СУММА(/КОЛИЧЕСТВО(/СРЕДНЕЕ(/МИНИМУМ(/МАКСИМУМ(
+        QueryOperator     = 19,
+        QueryFunction     = 20,
+        QueryType         = 21,
+        QueryConstant     = 22,
+        QueryParameter    = 23,
+        QueryPunctuation  = 24,
+
+        Count         = 25,
     };
 }
 
