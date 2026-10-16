@@ -175,7 +175,11 @@ int main(int argc, char** argv) {
                     int st = MapQueryCapture(std::string(nm, nl).c_str(), ts_node_type(cap.node));
                     if (st < 0) continue;
                     if ((st == 14 || st == 21 || st == 15) && FollowedByOpenParen(input, ce)) st = 20;
-                    toks.push_back({cs, std::string(QueryStyleName(st)) + "='" + input.substr(cs, ce-cs) + "'"});
+                    uint32_t pe = ce; bool parenTail = false;
+                    if (st == 18) { while (pe > cs && (input[pe-1]=='(' || input[pe-1]==' ' || input[pe-1]=='\t')) --pe; parenTail = pe < ce; }
+                    if (pe <= cs) continue;
+                    toks.push_back({cs, std::string(QueryStyleName(st)) + "='" + input.substr(cs, pe-cs) + "'"});
+                    if (parenTail) toks.push_back({pe, std::string("Q_PUNCT") + "='" + input.substr(pe, ce-pe) + "'"});
                 }
             }
             ts_query_cursor_delete(cur);

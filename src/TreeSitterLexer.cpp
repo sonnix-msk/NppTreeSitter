@@ -703,12 +703,30 @@ void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>
                          style == TSStyle::QueryIdentifier) &&
                         FollowedByOpenParen(input, ce))
                         style = TSStyle::QueryFunction;
+                    // The aggregate token is captured as "сумма(" (open paren
+                    // included by the grammar regex); split it so the name gets the
+                    // aggregate color and the bracket matches the closing ')' as
+                    // punctuation.
+                    uint32_t paintEnd = ce;
+                    bool parenTail = false;
+                    if (style == TSStyle::QueryAggregate) {
+                        while (paintEnd > cs &&
+                               (input[paintEnd - 1] == '(' || input[paintEnd - 1] == ' ' ||
+                                input[paintEnd - 1] == '\t'))
+                            --paintEnd;
+                        parenTail = paintEnd < ce;
+                    }
+                    if (paintEnd <= cs)
+                        continue;
                     // Same-start overlaps: keywords/functions/… must win over the
                     // generic identifier capture (e.g. ЕСТЬNULL is both a function
                     // and a @variable). Keep query highlights on top of the host
                     // BSL highlights (large pattern = painted later = wins).
                     const uint32_t prio = (style == TSStyle::QueryIdentifier) ? 1000000u : 1000001u;
-                    highlights.push_back({base + cs, base + ce, static_cast<char>(style), prio});
+                    highlights.push_back({base + cs, base + paintEnd, static_cast<char>(style), prio});
+                    if (parenTail)
+                        highlights.push_back({base + paintEnd, base + ce,
+                                              TSStyle::QueryPunctuation, prio});
                 }
             }
             ts_query_cursor_delete(cursor);
