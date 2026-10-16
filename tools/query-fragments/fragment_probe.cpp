@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -88,13 +89,87 @@ int main(int argc, char** argv) {
     TSTree* tree = ts_parser_parse_string(parser, nullptr, src.c_str(), (uint32_t)src.size());
     TSNode root = ts_tree_root_node(tree);
 
-    // Обход в поиске строковых литералов.
+    // --- Повтор логики плагина: одиночные литералы + склейки через '+' ---
+
+    // Печать подсвеченных токенов SDBL для заданного combined-текста.
+    auto dumpTokens = [&](const std::string& input, const std::vector<std::pair<uint32_t,uint32_t>>& spans) {
+        TSParser* sp = ts_parser_new();
+        ts_parser_set_language(sp, sdbl);
+        TSTree* st = ts_parser_parse_string(sp, nullptr, input.c_str(), (uint32_t)input.size());
+        TSNode sroot = ts_tree_root_node(st);
+        std::vector<TSNode> stk{sroot};
+        std::vector<std::pair<uint32_t, std::string>> toks;
+        int dropped = 0;
+        while (!stk.empty()) {
+            TSNode n = stk.back(); stk.pop_back();
+            if (ts_node_child_count(n) == 0 && ts_node_is_named(n)) {
+                uint32_t cs = ts_node_start_byte(n), ce = ts_node_end_byte(n);
+                bool inLit = false;
+                for (auto& sp2 : spans) if (cs >= sp2.first && ce <= sp2.second) { inLit = true; break; }
+                if (cs < ce && ce <= input.size() && inLit) {
+                    const bool lw = cs > 0 && IsWordByte((unsigned char)input[cs-1]);
+                    const bool rw = ce < input.size() && IsWordByte((unsigned char)input[ce]);
+                    if (lw || rw) ++dropped;
+                    else toks.push_back({cs, std::string(ts_node_type(n)) + "='" + input.substr(cs, ce-cs) + "'"});
+                }
+            }
+            uint32_t cc = ts_node_child_count(n);
+            for (uint32_t i = 0; i < cc; ++i) stk.push_back(ts_node_child(n, i));
+        }
+        std::sort(toks.begin(), toks.end());
+        std::string line = "         tokens: ";
+        for (size_t i = 0; i < toks.size() && i < 16; ++i) line += toks[i].second + " ";
+        if (dropped) line += ("  [dropped " + std::to_string(dropped) + " word-slice]");
+        std::printf("%s\n", line.c_str());
+        ts_tree_delete(st);
+        ts_parser_delete(sp);
+    };
+
+    auto isPlus = [&](TSNode n) {
+        if (std::strcmp(ts_node_type(n), "binary_expression") != 0) return false;
+        TSNode op = ts_node_child_by_field_name(n, "operator", 8);
+        if (ts_node_is_null(op)) return false;
+        uint32_t a = ts_node_start_byte(op), b = ts_node_end_byte(op);
+        return b == a + 1 && src[a] == '+';
+    };
+    auto unwrapExpr = [&](TSNode n) {
+        while (std::strcmp(ts_node_type(n), "expression") == 0) {
+            TSNode only = {}; int named = 0;
+            uint32_t cc = ts_node_child_count(n);
+            for (uint32_t i = 0; i < cc; ++i) { TSNode c = ts_node_child(n, i); if (ts_node_is_named(c)) { ++named; only = c; } }
+            if (named != 1) break;
+            n = only;
+        }
+        return n;
+    };
+    auto leaf = [&](TSNode n) {
+        while (true) {
+            const char* t = ts_node_type(n);
+            if (std::strcmp(t, "expression") != 0 && std::strcmp(t, "const_expression") != 0) return n;
+            TSNode only = {}; int named = 0;
+            uint32_t cc = ts_node_child_count(n);
+            for (uint32_t i = 0; i < cc; ++i) { TSNode c = ts_node_child(n, i); if (ts_node_is_named(c)) { ++named; only = c; } }
+            if (named != 1) return n;
+            n = only;
+        }
+    };
+    std::function<void(TSNode, std::vector<TSNode>&)> flatten = [&](TSNode expr, std::vector<TSNode>& out) {
+        TSNode n = unwrapExpr(expr);
+        if (isPlus(n)) {
+            flatten(ts_node_child_by_field_name(n, "left", 4), out);
+            flatten(ts_node_child_by_field_name(n, "right", 5), out);
+        } else if (!ts_node_is_null(expr)) {
+            out.push_back(expr);
+        }
+    };
+
     std::vector<TSNode> stack{root};
     int strings = 0, detected = 0;
     while (!stack.empty()) {
-        TSNode node = stack.back();
-        stack.pop_back();
-        if (ts_node_is_named(node) && std::strcmp(ts_node_type(node), "string") == 0) {
+        TSNode node = stack.back(); stack.pop_back();
+        const char* type = ts_node_type(node);
+
+        if (ts_node_is_named(node) && std::strcmp(type, "string") == 0) {
             uint32_t s = ts_node_start_byte(node), e = ts_node_end_byte(node);
             std::string input = MakeSdblInput(src.data() + s, e - s);
             qf::ScoreResult res = scorer.Score(input);
@@ -102,50 +177,56 @@ int main(int argc, char** argv) {
             ++strings;
             std::string human = StripWs(input);
             if (human.size() > 70) human = human.substr(0, 70) + "...";
-            std::printf("%s score=%.3f  \"%s\"\n", pass ? "[QUERY]" : "[str  ]", res.score,
-                        human.c_str());
+            std::printf("%s score=%.3f  \"%s\"\n", pass ? "[QUERY]" : "[str  ]", res.score, human.c_str());
+            if (pass) { ++detected; dumpTokens(input, {{0, (uint32_t)input.size()}}); }
+            continue;
+        }
+
+        if (isPlus(node)) {
+            TSNode parent = ts_node_parent(node);
+            if (!ts_node_is_null(parent) && isPlus(parent)) continue;  // под-группа
+            std::vector<TSNode> ops; flatten(node, ops);
+            uint32_t gs = ts_node_start_byte(node), ge = ts_node_end_byte(node);
+            std::vector<std::pair<uint32_t,uint32_t>> spans;
+            std::string scoreText;
+            bool ok = ops.size() >= 2 && ge <= src.size();
+            for (TSNode op : ops) {
+                if (!ok) break;
+                TSNode lf = leaf(op);
+                if (std::strcmp(ts_node_type(lf), "string") != 0) continue;
+                uint32_t s = ts_node_start_byte(lf), e = ts_node_end_byte(lf);
+                if (e > src.size()) { ok = false; break; }
+                spans.push_back({s - gs, e - gs});
+                scoreText += MakeSdblInput(src.data() + s, e - s);
+                scoreText += ' ';
+            }
+            if (!ok || spans.empty()) { continue; }
+            qf::ScoreResult res = scorer.Score(scoreText);
+            bool pass = res.score >= scorer.Threshold();
+            ++strings;
+            std::string human = StripWs(scoreText);
+            if (human.size() > 70) human = human.substr(0, 70) + "...";
+            std::printf("%s concat score=%.3f  \"%s\"\n", pass ? "[QUERY]" : "[str  ]", res.score, human.c_str());
             if (!pass) continue;
             ++detected;
-
-            // Парсинг SDBL и список токенов.
-            TSParser* sp = ts_parser_new();
-            ts_parser_set_language(sp, sdbl);
-            TSTree* st = ts_parser_parse_string(sp, nullptr, input.c_str(), (uint32_t)input.size());
-            TSNode sroot = ts_tree_root_node(st);
-            // Пройдём всё поддерево и покажем named-терминалы с текстом.
-            std::vector<TSNode> stk{sroot};
-            std::vector<std::pair<uint32_t, std::string>> toks;
-            int dropped = 0;
-            while (!stk.empty()) {
-                TSNode n = stk.back();
-                stk.pop_back();
-                if (ts_node_child_count(n) == 0 && ts_node_is_named(n)) {
-                    uint32_t cs = ts_node_start_byte(n), ce = ts_node_end_byte(n);
-                    if (cs < ce && ce <= input.size()) {
-                        const bool leftWord = cs > 0 && IsWordByte((unsigned char)input[cs - 1]);
-                        const bool rightWord = ce < input.size() && IsWordByte((unsigned char)input[ce]);
-                        if (leftWord || rightWord) {
-                            ++dropped;  // часть слова — не красим
-                        } else {
-                            toks.push_back({cs, std::string(ts_node_type(n)) + "='" + input.substr(cs, ce - cs) + "'"});
-                        }
-                    }
-                }
-                uint32_t cc = ts_node_child_count(n);
-                for (uint32_t i = 0; i < cc; ++i) stk.push_back(ts_node_child(n, i));
+            std::string combined(ge - gs, ' ');
+            for (auto& sp2 : spans) {
+                std::string piece = MakeSdblInput(src.data() + gs + sp2.first, sp2.second - sp2.first);
+                combined.replace(sp2.first, sp2.second - sp2.first, piece);
             }
-            std::sort(toks.begin(), toks.end());
-            std::string line = "         tokens: ";
-            for (size_t i = 0; i < toks.size() && i < 14; ++i) line += toks[i].second + " ";
-            if (dropped) line += ("  [dropped " + std::to_string(dropped) + " word-slice]");
-            std::printf("%s\n", line.c_str());
-            ts_tree_delete(st);
-            ts_parser_delete(sp);
-            continue;  // внутрь строк не спускаемся
+            for (TSNode op : ops) {
+                TSNode lf = leaf(op);
+                if (std::strcmp(ts_node_type(lf), "string") == 0) continue;
+                uint32_t s = ts_node_start_byte(op) - gs;
+                if (s < combined.size() && combined[s] == ' ') combined[s] = 'X';
+            }
+            dumpTokens(combined, spans);
+            continue;
         }
+
         uint32_t cc = ts_node_child_count(node);
         for (uint32_t i = 0; i < cc; ++i) stack.push_back(ts_node_child(node, i));
     }
-    std::printf("\nstrings=%d detected=%d\n", strings, detected);
+    std::printf("\nitems=%d detected=%d\n", strings, detected);
     return 0;
 }

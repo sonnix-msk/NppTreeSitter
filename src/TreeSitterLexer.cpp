@@ -567,7 +567,12 @@ std::string MakeSdblInput(const char* raw, size_t len)
 }
 
 // Parse `input` with the SDBL grammar and append its highlight captures to
-// `highlights`, offset by literalStart (identical offsets thanks to MakeSdblInput).
+// `highlights`, offset by `base` (identical offsets thanks to the
+// length-preserving construction of `input`).
+//
+// `literalSpans` are the byte ranges of `input` that correspond to real BSL
+// string text; a capture is only projected when it lies entirely inside one of
+// them (so text over a variable placeholder is never colored).
 //
 // The SDBL grammar defines keywords without word boundaries and gives the
 // identifier token a lower precedence (token(prec(-1, ...))), so a short keyword
@@ -575,16 +580,21 @@ std::string MakeSdblInput(const char* raw, size_t len)
 // BY_KEYWORD "По" + identifier "метка". Such captures are grammar artifacts, not
 // real keywords, so any capture that is only part of a larger word in the source
 // is dropped here (a genuine keyword is always delimited by non-word characters).
+struct ByteSpan {
+    uint32_t start;
+    uint32_t end;
+};
+
 bool IsWordByte(unsigned char c)
 {
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
            (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;  // ASCII word or any UTF-8 lead/continuation
 }
 
-void AddStringFragmentHighlights(const std::string& input, uint32_t literalStart,
-                                 const TreeSitterGrammar* sdblGrammar,
-                                 const TreeSitterStyleMap& styleMap,
-                                 std::vector<LexHighlight>& highlights)
+void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>& literalSpans,
+                           uint32_t base, const TreeSitterGrammar* sdblGrammar,
+                           const TreeSitterStyleMap& styleMap,
+                           std::vector<LexHighlight>& highlights)
 {
     TSParser* parser = ts_parser_new();
     if (!parser)
@@ -606,6 +616,13 @@ void AddStringFragmentHighlights(const std::string& input, uint32_t literalStart
                     const uint32_t ce = ts_node_end_byte(cap.node);
                     if (cs >= ce || ce > input.size())
                         continue;
+                    // Project only capturers that fall inside real string text.
+                    bool inLiteral = false;
+                    for (const ByteSpan& sp : literalSpans) {
+                        if (cs >= sp.start && ce <= sp.end) { inLiteral = true; break; }
+                    }
+                    if (!inLiteral)
+                        continue;
                     // Skip captures that are only a slice of a longer word.
                     const bool leftWord = cs > 0 &&
                         IsWordByte(static_cast<unsigned char>(input[cs - 1]));
@@ -616,8 +633,7 @@ void AddStringFragmentHighlights(const std::string& input, uint32_t literalStart
                     uint32_t nameLen = 0;
                     const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
                     const char style = styleMap.MapCapture(std::string(name, nameLen));
-                    highlights.push_back({literalStart + cs, literalStart + ce,
-                                          style, UINT32_MAX});
+                    highlights.push_back({base + cs, base + ce, style, UINT32_MAX});
                 }
             }
             ts_query_cursor_delete(cursor);
@@ -627,8 +643,131 @@ void AddStringFragmentHighlights(const std::string& input, uint32_t literalStart
     ts_parser_delete(parser);
 }
 
-// Walk the (pruned) tree for string literals, score each, and colorize the ones
-// that look like query fragments.
+// True when `node` is a binary_expression whose operator is a single '+' byte.
+bool IsPlusBinaryExpression(const char* docText, TSNode node)
+{
+    if (std::strcmp(ts_node_type(node), "binary_expression") != 0)
+        return false;
+    const TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+    if (ts_node_is_null(op))
+        return false;
+    const uint32_t a = ts_node_start_byte(op);
+    const uint32_t b = ts_node_end_byte(op);
+    return b == a + 1 && docText[a] == '+';
+}
+
+// Strip single-child "expression" wrappers (the grammar always wraps operands as
+// (expression ...)), so an operand's real form can be inspected.
+TSNode UnwrapExpression(TSNode node)
+{
+    while (std::strcmp(ts_node_type(node), "expression") == 0) {
+        TSNode only = {};
+        int named = 0;
+        const uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc; ++i) {
+            const TSNode c = ts_node_child(node, i);
+            if (ts_node_is_named(c)) { ++named; only = c; }
+        }
+        if (named != 1)
+            break;
+        node = only;
+    }
+    return node;
+}
+
+// Descend to the underlying leaf: expression -> const_expression -> string.
+TSNode UnwrapToLeaf(TSNode node)
+{
+    while (true) {
+        const char* t = ts_node_type(node);
+        if (std::strcmp(t, "expression") != 0 && std::strcmp(t, "const_expression") != 0)
+            return node;
+        TSNode only = {};
+        int named = 0;
+        const uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc; ++i) {
+            const TSNode c = ts_node_child(node, i);
+            if (ts_node_is_named(c)) { ++named; only = c; }
+        }
+        if (named != 1)
+            return node;
+        node = only;
+    }
+}
+
+// Flatten a chain of '+' binary_expression nodes (left-assoc: a+b+c is (a+b)+c)
+// into the flat list of operand nodes.
+void FlattenConcat(const char* docText, TSNode expr, std::vector<TSNode>& out)
+{
+    const TSNode node = UnwrapExpression(expr);
+    if (IsPlusBinaryExpression(docText, node)) {
+        FlattenConcat(docText, ts_node_child_by_field_name(node, "left", 4), out);
+        FlattenConcat(docText, ts_node_child_by_field_name(node, "right", 5), out);
+    } else if (!ts_node_is_null(expr)) {
+        out.push_back(expr);
+    }
+}
+
+// Handle a whole string-concatenation expression ("a" + X + "b"): score the
+// literal parts as one query fragment, and if it passes, color the SDBL tokens
+// that land on the literal parts (variables become neutral placeholders so the
+// parser keeps its bearings while their positions are skipped on projection).
+void HandleConcatGroup(const char* docText, uint32_t docLen, TSNode group,
+                       const qf::QueryFragmentScorer& scorer, const TreeSitterGrammar* sdbl,
+                       const TreeSitterStyleMap& styleMap,
+                       std::vector<LexHighlight>& highlights)
+{
+    std::vector<TSNode> operands;
+    FlattenConcat(docText, group, operands);
+    if (operands.size() < 2)
+        return;
+
+    const uint32_t groupStart = ts_node_start_byte(group);
+    const uint32_t groupEnd = ts_node_end_byte(group);
+    if (groupEnd > docLen || groupEnd <= groupStart)
+        return;
+
+    std::vector<ByteSpan> literalSpans;   // coordinates within the combined text
+    std::string scoreText;
+    for (const TSNode& op : operands) {
+        const TSNode leaf = UnwrapToLeaf(op);
+        if (std::strcmp(ts_node_type(leaf), "string") != 0)
+            continue;
+        const uint32_t s = ts_node_start_byte(leaf);
+        const uint32_t e = ts_node_end_byte(leaf);
+        if (e > docLen)
+            return;
+        literalSpans.push_back({ s - groupStart, e - groupStart });
+        scoreText += MakeSdblInput(docText + s, e - s);
+        scoreText += ' ';
+    }
+    if (literalSpans.empty())
+        return;
+    if (scorer.Score(scoreText).score < scorer.Threshold())
+        return;
+
+    // Build the length-preserving combined input: literal text with quotes/pipes
+    // blanked, a single neutral placeholder per non-literal operand, and spaces
+    // everywhere else (the '+' operators and whitespace between operands).
+    std::string combined(static_cast<size_t>(groupEnd - groupStart), ' ');
+    for (const ByteSpan& sp : literalSpans) {
+        const std::string piece = MakeSdblInput(docText + groupStart + sp.start, sp.end - sp.start);
+        combined.replace(sp.start, sp.end - sp.start, piece);
+    }
+    for (const TSNode& op : operands) {
+        const TSNode leaf = UnwrapToLeaf(op);
+        if (std::strcmp(ts_node_type(leaf), "string") == 0)
+            continue;
+        const uint32_t s = ts_node_start_byte(op) - groupStart;
+        if (s < combined.size() && combined[s] == ' ')
+            combined[s] = 'X';  // neutral identifier / value placeholder
+    }
+
+    AddFragmentHighlights(combined, literalSpans, groupStart, sdbl, styleMap, highlights);
+}
+
+// Walk the (pruned) tree for string literals and string concatenations, score
+// them, and colorize the ones that look like query fragments.
 void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
                                 TSNode rootNode, uint32_t startPos, uint32_t endPos,
                                 const TreeSitterStyleMap& styleMap,
@@ -651,13 +790,27 @@ void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
         const uint32_t ne = ts_node_end_byte(node);
         if (ns > endPos || ne < startPos)
             continue;  // outside the styled range
-        if (ts_node_is_named(node) && std::strcmp(ts_node_type(node), "string") == 0) {
+
+        const char* type = ts_node_type(node);
+        if (ts_node_is_named(node) && std::strcmp(type, "string") == 0) {
             if (ns < docLen && ne <= docLen && ns < ne) {
-                std::string input = MakeSdblInput(docText + ns, ne - ns);
+                const std::string input = MakeSdblInput(docText + ns, ne - ns);
                 if (scorer.Score(input).score >= scorer.Threshold())
-                    AddStringFragmentHighlights(input, ns, sdbl, styleMap, highlights);
+                    AddFragmentHighlights(input, {{0, static_cast<uint32_t>(input.size())}},
+                                          ns, sdbl, styleMap, highlights);
             }
             continue;  // strings do not nest - no need to descend
+        }
+        if (IsPlusBinaryExpression(docText, node)) {
+            // Handle the whole group once (at its topmost '+'); a nested '+'
+            // is only reached if its parent was not a '+', which cannot happen
+            // here because we never descend into a handled group.
+            const TSNode parent = ts_node_parent(node);
+            if (ts_node_is_null(parent) || !IsPlusBinaryExpression(docText, parent)) {
+                HandleConcatGroup(docText, docLen, node, scorer, sdbl, styleMap, highlights);
+                continue;  // do not descend: its strings are handled as a group
+            }
+            continue;
         }
         const uint32_t childCount = ts_node_child_count(node);
         for (uint32_t i = 0; i < childCount; ++i)
