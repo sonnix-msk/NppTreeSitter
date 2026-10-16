@@ -1,6 +1,7 @@
-#include "query_scorer.h"
+#include "QueryFragmentScorer.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -368,6 +369,23 @@ bool QueryFragmentScorer::LoadFromFile(const std::string& path) {
     std::ostringstream ss;
     ss << in.rdbuf();
     std::string data = ss.str();
+    if (data.size() >= 3 && static_cast<unsigned char>(data[0]) == 0xEF &&
+        static_cast<unsigned char>(data[1]) == 0xBB && static_cast<unsigned char>(data[2]) == 0xBF)
+        data.erase(0, 3);
+    return LoadFromJson(data);
+}
+
+bool QueryFragmentScorer::LoadFromFileW(const std::wstring& path) {
+    // Узкий ifstream не открывает пути с не-ASCII (кириллица). Читаем через _wfopen.
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp)
+        return false;
+    std::string data;
+    char buf[8192];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0)
+        data.append(buf, n);
+    std::fclose(fp);
     if (data.size() >= 3 && static_cast<unsigned char>(data[0]) == 0xEF &&
         static_cast<unsigned char>(data[1]) == 0xBB && static_cast<unsigned char>(data[2]) == 0xBF)
         data.erase(0, 3);

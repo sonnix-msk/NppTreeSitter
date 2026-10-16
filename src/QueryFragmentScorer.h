@@ -34,6 +34,8 @@ public:
     bool LoadFromJson(const std::string& json);
     // Загрузить из файла. Возвращает false, если файл не прочитан/не распознан.
     bool LoadFromFile(const std::string& path);
+    // То же, но с широким путём (корректно для путей с не-ASCII, напр. кириллицей).
+    bool LoadFromFileW(const std::wstring& path);
 
     bool IsLoaded() const { return m_loaded; }
     double Threshold() const { return m_threshold; }

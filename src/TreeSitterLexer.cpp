@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "TreeSitterLexer.h"
+#include "QueryFragmentScorer.h"
 
 #include <tree_sitter/api.h>
 
@@ -522,6 +523,151 @@ static TSPoint PointAtByte(const char* text, uint32_t len, uint32_t byteOffset)
 }
 
 // ---------------------------------------------------------------------------
+// Query fragments (BSL only): highlight SDBL query text embedded in BSL string
+// literals. Detection is probabilistic - a fragment may be the middle of a query
+// and does not parse as a whole - so the text is scored with features from
+// lexicon.json and, past the threshold, the SDBL grammar is used purely as a
+// colorizer. See docs/QUERY-FRAGMENTS.md.
+// ---------------------------------------------------------------------------
+namespace {
+
+const qf::QueryFragmentScorer& QueryFragmentScorerFor(const std::wstring& grammarDir)
+{
+    static qf::QueryFragmentScorer scorer;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        if (!grammarDir.empty())
+            scorer.LoadFromFileW(grammarDir + L"\\bsl-query-fragments.json");
+    }
+    return scorer;
+}
+
+// Replace double quotes and line-continuation pipes with spaces, keeping the
+// byte length identical so SDBL token offsets map 1:1 back onto the literal.
+std::string MakeSdblInput(const char* raw, size_t len)
+{
+    std::string out(raw, len);
+    size_t lineStart = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const char c = out[i];
+        if (c == '"') {
+            out[i] = ' ';
+        } else if (c == '\n') {
+            lineStart = i + 1;
+        } else if (c == '|') {
+            bool onlyWs = true;
+            for (size_t j = lineStart; j < i; ++j) {
+                if (out[j] != ' ' && out[j] != '\t') { onlyWs = false; break; }
+            }
+            if (onlyWs) out[i] = ' ';  // leading '|' is BSL continuation, not SDBL
+        }
+    }
+    return out;
+}
+
+// Parse `input` with the SDBL grammar and append its highlight captures to
+// `highlights`, offset by literalStart (identical offsets thanks to MakeSdblInput).
+//
+// The SDBL grammar defines keywords without word boundaries and gives the
+// identifier token a lower precedence (token(prec(-1, ...))), so a short keyword
+// can win over a longer identifier and split a real word: e.g. "Пометка" becomes
+// BY_KEYWORD "По" + identifier "метка". Such captures are grammar artifacts, not
+// real keywords, so any capture that is only part of a larger word in the source
+// is dropped here (a genuine keyword is always delimited by non-word characters).
+bool IsWordByte(unsigned char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;  // ASCII word or any UTF-8 lead/continuation
+}
+
+void AddStringFragmentHighlights(const std::string& input, uint32_t literalStart,
+                                 const TreeSitterGrammar* sdblGrammar,
+                                 const TreeSitterStyleMap& styleMap,
+                                 std::vector<LexHighlight>& highlights)
+{
+    TSParser* parser = ts_parser_new();
+    if (!parser)
+        return;
+    ts_parser_set_language(parser, sdblGrammar->GetLanguage());
+    TSTree* tree = ts_parser_parse_string(parser, nullptr, input.c_str(),
+                                          static_cast<uint32_t>(input.size()));
+    if (tree) {
+        const TSQuery* query = sdblGrammar->GetHighlightQuery();
+        TSNode root = ts_tree_root_node(tree);
+        TSQueryCursor* cursor = ts_query_cursor_new();
+        if (cursor) {
+            ts_query_cursor_exec(cursor, query, root);
+            TSQueryMatch match;
+            while (ts_query_cursor_next_match(cursor, &match)) {
+                for (uint16_t i = 0; i < match.capture_count; ++i) {
+                    const TSQueryCapture& cap = match.captures[i];
+                    const uint32_t cs = ts_node_start_byte(cap.node);
+                    const uint32_t ce = ts_node_end_byte(cap.node);
+                    if (cs >= ce || ce > input.size())
+                        continue;
+                    // Skip captures that are only a slice of a longer word.
+                    const bool leftWord = cs > 0 &&
+                        IsWordByte(static_cast<unsigned char>(input[cs - 1]));
+                    const bool rightWord = ce < input.size() &&
+                        IsWordByte(static_cast<unsigned char>(input[ce]));
+                    if (leftWord || rightWord)
+                        continue;
+                    uint32_t nameLen = 0;
+                    const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
+                    const char style = styleMap.MapCapture(std::string(name, nameLen));
+                    highlights.push_back({literalStart + cs, literalStart + ce,
+                                          style, UINT32_MAX});
+                }
+            }
+            ts_query_cursor_delete(cursor);
+        }
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
+}
+
+// Walk the (pruned) tree for string literals, score each, and colorize the ones
+// that look like query fragments.
+void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
+                                TSNode rootNode, uint32_t startPos, uint32_t endPos,
+                                const TreeSitterStyleMap& styleMap,
+                                std::vector<LexHighlight>& highlights)
+{
+    TreeSitterRegistry& registry = TreeSitterRegistry::Instance();
+    const qf::QueryFragmentScorer& scorer = QueryFragmentScorerFor(registry.GetGrammarDir());
+    if (!scorer.IsLoaded())
+        return;
+    const TreeSitterGrammar* sdbl = registry.GetGrammarByName("sdbl");
+    if (!sdbl || !sdbl->GetLanguage() || !sdbl->GetHighlightQuery())
+        return;
+
+    std::vector<TSNode> stack;
+    stack.push_back(rootNode);
+    while (!stack.empty()) {
+        const TSNode node = stack.back();
+        stack.pop_back();
+        const uint32_t ns = ts_node_start_byte(node);
+        const uint32_t ne = ts_node_end_byte(node);
+        if (ns > endPos || ne < startPos)
+            continue;  // outside the styled range
+        if (ts_node_is_named(node) && std::strcmp(ts_node_type(node), "string") == 0) {
+            if (ns < docLen && ne <= docLen && ns < ne) {
+                std::string input = MakeSdblInput(docText + ns, ne - ns);
+                if (scorer.Score(input).score >= scorer.Threshold())
+                    AddStringFragmentHighlights(input, ns, sdbl, styleMap, highlights);
+            }
+            continue;  // strings do not nest - no need to descend
+        }
+        const uint32_t childCount = ts_node_child_count(node);
+        for (uint32_t i = 0; i < childCount; ++i)
+            stack.push_back(ts_node_child(node, i));
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Lex() - The core: parse document with tree-sitter, apply Scintilla styles
 // ---------------------------------------------------------------------------
 void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengthDoc,
@@ -974,6 +1120,19 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
                 ts_parser_delete(pInjParser);
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 4b: Query fragments inside string literals (BSL only)
+    // ---------------------------------------------------------------
+    // The stock injection mechanism (Step 4) can't be used here: it ignores
+    // query predicates and cannot glue concatenations. Instead we score string
+    // literals with our own detector and colorize the ones that look like SDBL.
+    if (m_grammar->GetName() == "bsl") {
+        AddQueryFragmentHighlights(docText, static_cast<uint32_t>(docLen), rootNode,
+                                   static_cast<uint32_t>(startPos),
+                                   static_cast<uint32_t>(endPos),
+                                   m_styleMap, highlights);
     }
 
     // ---------------------------------------------------------------

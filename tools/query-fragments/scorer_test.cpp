@@ -5,7 +5,7 @@
 // lines.txt — UTF-8, по одному тестовому тексту на строку (без внешних кавычек BSL).
 // Печатает: score<TAB>текст  — по одной строке на вход.
 
-#include "query_scorer.h"
+#include "QueryFragmentScorer.h"
 
 #include <cstdio>
 #include <fstream>
