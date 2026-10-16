@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -105,9 +107,19 @@ constexpr UINT SCI_GRABFOCUS = 2400;
 constexpr UINT SCI_GETTEXTRANGEFULL = 2039;
 constexpr UINT SCI_GETLEXERLANGUAGE = 4012;
 constexpr UINT SCI_SETILEXER = 4033;
+constexpr UINT SCI_STYLECLEARALL = 2050;
 constexpr UINT SCI_STYLESETFORE = 2051;
+constexpr UINT SCI_STYLESETBACK = 2052;
 constexpr UINT SCI_STYLESETBOLD = 2053;
 constexpr UINT SCI_STYLESETITALIC = 2054;
+constexpr UINT SCI_STYLESETSIZE = 2055;
+constexpr UINT SCI_STYLESETFONT = 2056;
+constexpr UINT SCI_STYLESETUNDERLINE = 2059;
+constexpr UINT SCI_STYLESETSIZEFRACTIONAL = 2061;
+constexpr UINT SCI_STYLEGETSIZEFRACTIONAL = 2062;
+constexpr UINT SCI_STYLEGETFONT = 2486;
+constexpr int  SC_FONT_SIZE_MULTIPLIER = 100;
+constexpr int  STYLE_DEFAULT_INDEX = 32;
 constexpr UINT SCI_GETDOCPOINTER = 2357;
 constexpr UINT SCI_INDICSETSTYLE = 2080;
 constexpr UINT SCI_INDICSETFORE = 2081;
@@ -531,14 +543,265 @@ bool CanInstallBundledGrammarForCurrentFile(HWND hSci)
     return IsBundledGrammarBuildAvailable(language);
 }
 
-// Apply the tree-sitter style palette directly to the Scintilla view. Notepad++
-// only applies the <LexerType> WordsStyle colors from TreeSitterLexer.xml for
-// menu-selected languages that have an entry there (the original curated set), and
-// it does not restore external-lexer styles on session reload. Setting the colors
-// here makes EVERY grammar color correctly regardless of menu exposure / XML.
-void ApplyTreeSitterStyleColors(HWND hSci)
+// --- Style palette ----------------------------------------------------------
+// The palette lives in <LexerType name="treesitter.<language>"> inside the
+// installed config XML (plugins\Config\TreeSitterLexer.xml) - the same file
+// Notepad++ reads when the language is picked from the Language menu. Reading
+// it here keeps auto-detect and session reload consistent with the menu path,
+// and lets colors/bold/italic be retuned in the XML without rebuilding.
+//
+// Notepad++ itself does not re-apply external-lexer styles on session reload,
+// which is why the plugin pushes the palette to Scintilla directly; that is why
+// the palette must be read here rather than left to the menu command.
+
+struct TsStyleDef {
+    bool present = false;
+    bool hasFg = false;
+    int fg = 0;          // 0xRRGGBB
+    bool hasBg = false;
+    int bg = 0;          // 0xRRGGBB
+    int fontStyle = 0;   // Scintilla bits: 1 bold, 2 italic, 4 underline
+    bool hasFontName = false;
+    std::string fontName;
+    bool hasSize = false;
+    int size = 0;        // points
+};
+
+bool ReadFileBytes(const std::wstring& path, std::string& out)
 {
-    // Indexed by TSStyle id (0..13); 0xRRGGBB, matching TreeSitterLexer.xml.
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+bool GetXmlAttr(const std::string& tag, const std::string& key, std::string& value)
+{
+    const std::string needle = key + "=";
+    size_t p = tag.find(needle);
+    if (p == std::string::npos)
+        return false;
+    // Require an attribute boundary so "styleID" does not match inside "fontStyleID".
+    if (p > 0) {
+        const char prev = tag[p - 1];
+        if (prev != ' ' && prev != '\t' && prev != '\r' && prev != '\n')
+            return false;
+    }
+    p += needle.size();
+    if (p >= tag.size())
+        return false;
+    const char quote = tag[p];
+    if (quote != '"' && quote != '\'')
+        return false;
+    const size_t end = tag.find(quote, p + 1);
+    if (end == std::string::npos)
+        return false;
+    value = tag.substr(p + 1, end - p - 1);
+    return true;
+}
+
+bool ParseHexColor(const std::string& s, int& rgb)
+{
+    if (s.size() != 6)
+        return false;
+    int value = 0;
+    for (char c : s) {
+        int digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else return false;
+        value = (value << 4) | digit;
+    }
+    rgb = value;
+    return true;
+}
+
+int ParseInt(const std::string& s)
+{
+    return std::atoi(s.c_str());
+}
+
+// Load the <WordsStyle> definitions for "treesitter.<language>" from the config
+// XML. Notepad++ reads plugin config XMLs from BOTH the install tree
+// (<npp>\plugins\Config) and the writable user config dir; with a roaming
+// profile the latter (NPPM_GETPLUGINSCONFIGDIR) is empty while the file lives in
+// the install tree, so every candidate is tried. Returns false when none of the
+// locations has the file or the language entry, so the caller can fall back to
+// the built-in palette.
+bool LoadPaletteFromConfigXml(const std::string& language, std::vector<TsStyleDef>& styles)
+{
+    styles.clear();
+    if (language.empty())
+        return false;
+
+    std::vector<std::wstring> candidates;
+    const std::wstring cfgDir = GetPluginConfigDirectory();
+    if (!cfgDir.empty())
+        candidates.push_back(cfgDir + L"\\TreeSitterLexer.xml");
+
+    // Module directory is <npp>\plugins\TreeSitterLexer; the install-tree config
+    // sits two levels up in <npp>\plugins\Config.
+    const std::wstring moduleDir = GetModuleDirectory();
+    if (!moduleDir.empty()) {
+        candidates.push_back(moduleDir + L"\\..\\Config\\TreeSitterLexer.xml");
+        candidates.push_back(moduleDir + L"\\Config\\TreeSitterLexer.xml");
+    }
+
+    std::string data;
+    bool loaded = false;
+    for (const auto& path : candidates) {
+        if (FileExists(path) && ReadFileBytes(path, data)) {
+            loaded = true;
+            break;
+        }
+    }
+    if (!loaded)
+        return false;
+
+    // Strip a UTF-8 BOM if present; attributes we read are ASCII either way.
+    if (data.size() >= 3 &&
+        static_cast<unsigned char>(data[0]) == 0xEF &&
+        static_cast<unsigned char>(data[1]) == 0xBB &&
+        static_cast<unsigned char>(data[2]) == 0xBF) {
+        data.erase(0, 3);
+    }
+
+    const std::string target = "treesitter." + language;
+
+    size_t blockStart = std::string::npos;
+    size_t blockEnd = std::string::npos;
+    size_t pos = 0;
+    while (true) {
+        const size_t lt = data.find("<LexerType", pos);
+        if (lt == std::string::npos)
+            break;
+        const size_t gt = data.find('>', lt);
+        if (gt == std::string::npos)
+            break;
+        const std::string tag = data.substr(lt, gt - lt + 1);
+        std::string name;
+        if (GetXmlAttr(tag, "name", name) && ToLowerAscii(name) == ToLowerAscii(target)) {
+            blockStart = gt + 1;
+            const size_t close = data.find("</LexerType>", blockStart);
+            blockEnd = (close == std::string::npos) ? data.size() : close;
+            break;
+        }
+        pos = gt + 1;
+    }
+    if (blockStart == std::string::npos)
+        return false;
+
+    const std::string block = data.substr(blockStart, blockEnd - blockStart);
+    size_t p = 0;
+    while (true) {
+        const size_t ws = block.find("<WordsStyle", p);
+        if (ws == std::string::npos)
+            break;
+        const size_t wg = block.find('>', ws);
+        if (wg == std::string::npos)
+            break;
+        const std::string tag = block.substr(ws, wg - ws + 1);
+        p = wg + 1;
+
+        std::string idStr;
+        if (!GetXmlAttr(tag, "styleID", idStr))
+            continue;
+        const int id = ParseInt(idStr);
+        if (id < 0 || id >= 64)
+            continue;
+        if (styles.size() <= static_cast<size_t>(id))
+            styles.resize(static_cast<size_t>(id) + 1);
+
+        TsStyleDef& def = styles[static_cast<size_t>(id)];
+        def.present = true;
+
+        std::string value;
+        int rgb = 0;
+        if (GetXmlAttr(tag, "fgColor", value) && ParseHexColor(value, rgb)) {
+            def.hasFg = true;
+            def.fg = rgb;
+        }
+        if (GetXmlAttr(tag, "bgColor", value) && ParseHexColor(value, rgb)) {
+            def.hasBg = true;
+            def.bg = rgb;
+        }
+        if (GetXmlAttr(tag, "fontStyle", value))
+            def.fontStyle = ParseInt(value);
+        if (GetXmlAttr(tag, "fontName", value) && !value.empty()) {
+            def.hasFontName = true;
+            def.fontName = value;
+        }
+        if (GetXmlAttr(tag, "fontSize", value)) {
+            const int size = ParseInt(value);
+            if (size > 0) {
+                def.hasSize = true;
+                def.size = size;
+            }
+        }
+    }
+
+    return !styles.empty();
+}
+
+COLORREF RgbToColorRef(int rgb)
+{
+    return ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+}
+
+// Apply the tree-sitter style palette to the Scintilla view. Prefers the palette
+// from the config XML (so it matches what the Language menu would apply, and can
+// be retuned without rebuilding); falls back to the built-in stock palette when
+// the XML or the language entry is unavailable.
+//
+// Fonts: Notepad++ normally fills lexer styles from stylers.xml when a language
+// is picked from the menu. When the plugin attaches a lexer directly (auto-detect
+// / session reload) the styles would otherwise keep Scintilla's uninitialised
+// size (0) and render as unreadably tiny text, so the font name/size are taken
+// from STYLE_DEFAULT (which Notepad++ configures to the global editor font) and
+// pushed here. A fontName/fontSize in the XML entry overrides that per style.
+void ApplyTreeSitterStyleColors(HWND hSci, const std::string& language)
+{
+    std::string defaultFont;
+    {
+        char buf[256] = {};
+        const LRESULT len = ::SendMessageW(hSci, SCI_STYLEGETFONT, STYLE_DEFAULT_INDEX,
+                                           reinterpret_cast<LPARAM>(buf));
+        if (len > 0)
+            defaultFont.assign(buf, static_cast<size_t>(len));
+    }
+    int defaultSize = static_cast<int>(::SendMessageW(hSci, SCI_STYLEGETSIZEFRACTIONAL,
+                                                      STYLE_DEFAULT_INDEX, 0));
+    if (defaultSize <= 0)
+        defaultSize = 10 * SC_FONT_SIZE_MULTIPLIER;
+
+    std::vector<TsStyleDef> styles;
+    if (LoadPaletteFromConfigXml(language, styles)) {
+        for (size_t i = 0; i < styles.size(); ++i) {
+            const TsStyleDef& def = styles[i];
+            if (!def.present)
+                continue;
+            const int styleId = static_cast<int>(i);
+            if (def.hasFg)
+                ::SendMessageW(hSci, SCI_STYLESETFORE, styleId, static_cast<LPARAM>(RgbToColorRef(def.fg)));
+            if (def.hasBg)
+                ::SendMessageW(hSci, SCI_STYLESETBACK, styleId, static_cast<LPARAM>(RgbToColorRef(def.bg)));
+
+            const std::string& fontName = def.hasFontName ? def.fontName : defaultFont;
+            const int size = def.hasSize ? def.size * SC_FONT_SIZE_MULTIPLIER : defaultSize;
+            if (!fontName.empty())
+                ::SendMessageW(hSci, SCI_STYLESETFONT, styleId, reinterpret_cast<LPARAM>(fontName.c_str()));
+            ::SendMessageW(hSci, SCI_STYLESETSIZEFRACTIONAL, styleId, static_cast<LPARAM>(size));
+
+            ::SendMessageW(hSci, SCI_STYLESETBOLD, styleId, (def.fontStyle & 1) ? 1 : 0);
+            ::SendMessageW(hSci, SCI_STYLESETITALIC, styleId, (def.fontStyle & 2) ? 1 : 0);
+            ::SendMessageW(hSci, SCI_STYLESETUNDERLINE, styleId, (def.fontStyle & 4) ? 1 : 0);
+        }
+        return;
+    }
+
+    // Fallback: built-in palette (indexed by TSStyle id 0..13; 0xRRGGBB).
     static const int kFore[] = {
         0x000000, // 0 default
         0x008000, // 1 comment
@@ -556,9 +819,10 @@ void ApplyTreeSitterStyleColors(HWND hSci)
         0x0000FF, // 13 tag
     };
     for (int i = 0; i < static_cast<int>(std::size(kFore)); ++i) {
-        const int rgb = kFore[i];
-        const COLORREF bgr = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
-        ::SendMessageW(hSci, SCI_STYLESETFORE, i, static_cast<LPARAM>(bgr));
+        ::SendMessageW(hSci, SCI_STYLESETFORE, i, static_cast<LPARAM>(RgbToColorRef(kFore[i])));
+        if (!defaultFont.empty())
+            ::SendMessageW(hSci, SCI_STYLESETFONT, i, reinterpret_cast<LPARAM>(defaultFont.c_str()));
+        ::SendMessageW(hSci, SCI_STYLESETSIZEFRACTIONAL, i, static_cast<LPARAM>(defaultSize));
     }
     ::SendMessageW(hSci, SCI_STYLESETBOLD, 3, 1);    // keyword bold
     ::SendMessageW(hSci, SCI_STYLESETITALIC, 2, 1);  // doc comment italic
@@ -580,7 +844,7 @@ bool ActivateTreeSitterLexer(HWND hSci, const std::string& language)
         return false;
 
     ::SendMessageW(hSci, SCI_SETILEXER, 0, reinterpret_cast<LPARAM>(lexer));
-    ApplyTreeSitterStyleColors(hSci);
+    ApplyTreeSitterStyleColors(hSci, language);
     ::SendMessageW(hSci, SCI_CLEARDOCUMENTSTYLE, 0, 0);
     const auto docLen = static_cast<Sci_Position>(::SendMessageW(hSci, SCI_GETLENGTH, 0, 0));
     ::SendMessageW(hSci, SCI_COLOURISE, 0, static_cast<LPARAM>(docLen));
@@ -2159,7 +2423,7 @@ void autoDetectTreeSitterLanguage()
         // the palette (cheap). Only re-parse if the document isn't already fully
         // styled (e.g. just restored from a session) - this avoids re-lexing the
         // whole file every time the tab is revisited.
-        ApplyTreeSitterStyleColors(hSci);
+        ApplyTreeSitterStyleColors(hSci, language);
         const auto docLen = static_cast<Sci_Position>(::SendMessageW(hSci, SCI_GETLENGTH, 0, 0));
         const auto endStyled = static_cast<Sci_Position>(::SendMessageW(hSci, SCI_GETENDSTYLED, 0, 0));
         if (endStyled < docLen)
