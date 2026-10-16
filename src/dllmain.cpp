@@ -908,6 +908,9 @@ std::string DetectTreeSitterLanguageForFile(const std::wstring& path, const std:
         { L"mkd", "markdown" },
         { L"cmake", "cmake" },
         { L"sql", "sql" },
+        // 1C:Enterprise query language (SDBL), standalone documents.
+        { L"sdbl", "sdbl" },
+        { L"1cquery", "sdbl" },
         { L"f", "fortran" },
         { L"for", "fortran" },
         { L"f90", "fortran" },

@@ -646,6 +646,33 @@ bool FollowedByOpenParen(const std::string& input, size_t pos)
     return pos < input.size() && input[pos] == '(';
 }
 
+// Resolve the query-palette style for one SDBL capture, shared by the fragment
+// pass and by standalone .sdbl documents. Applies the bracket rule (keyword/type/
+// identifier followed by '(' reads as a function) and, for aggregates, splits the
+// trailing '(' off the token so the name is painted and the bracket stays
+// punctuation. Returns the style, or -1 to skip the capture. `paintEnd`/`parenTail`
+// describe what to emit.
+int ResolveQueryStyle(const std::string& capture, const char* nodeType,
+                      const std::string& text, uint32_t cs, uint32_t ce,
+                      uint32_t& paintEnd, bool& parenTail)
+{
+    paintEnd = ce;
+    parenTail = false;
+    int style = MapQueryCapture(capture, nodeType);
+    if (style < 0)
+        return -1;
+    if ((style == TSStyle::QueryKeyword || style == TSStyle::QueryType ||
+         style == TSStyle::QueryIdentifier) && FollowedByOpenParen(text, ce))
+        style = TSStyle::QueryFunction;
+    if (style == TSStyle::QueryAggregate) {
+        while (paintEnd > cs && (text[paintEnd - 1] == '(' || text[paintEnd - 1] == ' ' ||
+                                 text[paintEnd - 1] == '\t'))
+            --paintEnd;
+        parenTail = paintEnd < ce;
+    }
+    return style;
+}
+
 void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>& literalSpans,
                            uint32_t base, const TreeSitterGrammar* sdblGrammar,
                            std::vector<LexHighlight>& highlights)
@@ -691,32 +718,12 @@ void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>
                         continue;
                     uint32_t nameLen = 0;
                     const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
-                    int style = MapQueryCapture(std::string(name, nameLen),
-                                                ts_node_type(cap.node));
-                    if (style < 0)
-                        continue;  // capture intentionally skipped
-                    // Bracket rule: a keyword/type/identifier immediately followed
-                    // by '(' is a call-like word rendered as a function
-                    // (ДАТАВРЕМЯ(, ТИП(, ЗНАЧЕНИЕ(, ПРЕДСТАВЛЕНИЕ(, …). Constants
-                    // and numbers are excluded (Истина isn't a call).
-                    if ((style == TSStyle::QueryKeyword || style == TSStyle::QueryType ||
-                         style == TSStyle::QueryIdentifier) &&
-                        FollowedByOpenParen(input, ce))
-                        style = TSStyle::QueryFunction;
-                    // The aggregate token is captured as "сумма(" (open paren
-                    // included by the grammar regex); split it so the name gets the
-                    // aggregate color and the bracket matches the closing ')' as
-                    // punctuation.
                     uint32_t paintEnd = ce;
                     bool parenTail = false;
-                    if (style == TSStyle::QueryAggregate) {
-                        while (paintEnd > cs &&
-                               (input[paintEnd - 1] == '(' || input[paintEnd - 1] == ' ' ||
-                                input[paintEnd - 1] == '\t'))
-                            --paintEnd;
-                        parenTail = paintEnd < ce;
-                    }
-                    if (paintEnd <= cs)
+                    const int style = ResolveQueryStyle(std::string(name, nameLen),
+                                                        ts_node_type(cap.node), input,
+                                                        cs, ce, paintEnd, parenTail);
+                    if (style < 0 || paintEnd <= cs)
                         continue;
                     // Same-start overlaps: keywords/functions/… must win over the
                     // generic identifier capture (e.g. ЕСТЬNULL is both a function
@@ -1129,6 +1136,9 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
     // Key: (startByte << 32 | endByte). Assumes files < 4 GB.
     std::unordered_map<uint64_t, char> nodeHighlightMap;
 
+    // Standalone query documents get the dedicated query palette (see below).
+    const bool isSdblGrammar = (m_grammar->GetName() == "sdbl");
+
     TSQueryMatch match;
     while (ts_query_cursor_next_match(cursor, &match)) {
         if (!EvaluatePredicates(query, match, docText, static_cast<uint32_t>(docLen)))
@@ -1143,10 +1153,30 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
                 query, capture.index, &nameLen);
 
             std::string captureName(name, nameLen);
-            char style = m_styleMap.MapCapture(captureName);
 
             uint32_t nodeStart = ts_node_start_byte(node);
             uint32_t nodeEnd = ts_node_end_byte(node);
+
+            // Standalone .sdbl / .1cquery documents: the whole file is a query, so
+            // use the dedicated query palette (same mapping as the fragments inside
+            // BSL strings) instead of the generic code palette.
+            if (isSdblGrammar) {
+                uint32_t paintEnd = nodeEnd;
+                bool parenTail = false;
+                const int qstyle = ResolveQueryStyle(captureName, ts_node_type(node),
+                                                     m_lastText, nodeStart, nodeEnd,
+                                                     paintEnd, parenTail);
+                if (qstyle < 0 || paintEnd <= nodeStart)
+                    continue;
+                const uint32_t prio = static_cast<uint32_t>(match.pattern_index) * 2u +
+                    (qstyle == TSStyle::QueryIdentifier ? 0u : 1u);
+                highlights.push_back({ nodeStart, paintEnd, static_cast<char>(qstyle), prio });
+                if (parenTail)
+                    highlights.push_back({ paintEnd, nodeEnd, TSStyle::QueryPunctuation, prio });
+                continue;
+            }
+
+            char style = m_styleMap.MapCapture(captureName);
 
             if (nodeStart < nodeEnd) {
                 highlights.push_back({ nodeStart, nodeEnd, style, match.pattern_index });
