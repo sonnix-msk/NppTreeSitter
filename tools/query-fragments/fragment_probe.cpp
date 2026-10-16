@@ -66,6 +66,42 @@ static bool IsWordByte(unsigned char c) {
            (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;
 }
 
+// Имена стилей запроса (совпадают с TSStyle 14..24).
+static const char* QueryStyleName(int id) {
+    switch (id) {
+        case 3:  return "COMMENT";
+        case 14: return "Q_KEYWORD";
+        case 15: return "Q_IDENT";
+        case 16: return "Q_STRING";
+        case 17: return "Q_NUMBER";
+        case 18: return "Q_DATE";
+        case 19: return "Q_OPER";
+        case 20: return "Q_FUNC";
+        case 21: return "Q_TYPE";
+        case 22: return "Q_CONST";
+        case 23: return "Q_PARAM";
+        case 24: return "Q_PUNCT";
+        default: return "Q?";
+    }
+}
+
+// Копия MapQueryCapture из плагина (для объективной проверки).
+static int MapQueryCapture(const char* capture, const char* nodeType) {
+    auto is = [&](const char* n) { return nodeType && std::strcmp(nodeType, n) == 0; };
+    if (std::strcmp(capture, "constant.builtin") == 0 && is("parameter")) return 23;
+    if (std::strcmp(capture, "comment") == 0) return 3;
+    if (std::strncmp(capture, "keyword", 7) == 0) return 14;
+    if (std::strncmp(capture, "type", 4) == 0) return 21;
+    if (std::strncmp(capture, "constant", 8) == 0) return (is("date") || is("date_time_literal")) ? 18 : 22;
+    if (std::strncmp(capture, "variable", 8) == 0) return 15;
+    if (std::strncmp(capture, "function", 8) == 0 || std::strncmp(capture, "method", 6) == 0) return 20;
+    if (std::strncmp(capture, "operator", 8) == 0) return 19;
+    if (std::strncmp(capture, "punctuation", 11) == 0) return 24;
+    if (std::strncmp(capture, "number", 6) == 0 || std::strcmp(capture, "float") == 0) return 17;
+    if (std::strncmp(capture, "string", 6) == 0 || std::strcmp(capture, "character") == 0) return 16;
+    return 15;
+}
+
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::fprintf(stderr, "usage: fragment_probe <bsl.dll> <sdbl.dll> <lexicon.json> <file.bsl>\n");
@@ -92,33 +128,69 @@ int main(int argc, char** argv) {
     // --- Повтор логики плагина: одиночные литералы + склейки через '+' ---
 
     // Печать подсвеченных токенов SDBL для заданного combined-текста.
+    // Прогоняем НАСТОЯЩИЙ highlights-запрос SDBL и мапим капчуры в стили.
+    const char* scmPath = (argc >= 6) ? argv[5] : nullptr;
+    std::string scmSrc;
+    if (scmPath) scmSrc = ReadFile(scmPath);
+    TSQuery* sdblQuery = nullptr;
+    if (!scmSrc.empty()) {
+        uint32_t errOff = 0; TSQueryError err = TSQueryErrorNone;
+        sdblQuery = ts_query_new(sdbl, scmSrc.c_str(), (uint32_t)scmSrc.size(), &errOff, &err);
+        if (err != TSQueryErrorNone) { std::fprintf(stderr, "scm error at %u type %d\n", errOff, (int)err); sdblQuery = nullptr; }
+    } else {
+        std::fprintf(stderr, "no scm given - tokens shown by node type\n");
+    }
+
     auto dumpTokens = [&](const std::string& input, const std::vector<std::pair<uint32_t,uint32_t>>& spans) {
         TSParser* sp = ts_parser_new();
         ts_parser_set_language(sp, sdbl);
         TSTree* st = ts_parser_parse_string(sp, nullptr, input.c_str(), (uint32_t)input.size());
         TSNode sroot = ts_tree_root_node(st);
-        std::vector<TSNode> stk{sroot};
         std::vector<std::pair<uint32_t, std::string>> toks;
         int dropped = 0;
-        while (!stk.empty()) {
-            TSNode n = stk.back(); stk.pop_back();
-            if (ts_node_child_count(n) == 0 && ts_node_is_named(n)) {
-                uint32_t cs = ts_node_start_byte(n), ce = ts_node_end_byte(n);
-                bool inLit = false;
-                for (auto& sp2 : spans) if (cs >= sp2.first && ce <= sp2.second) { inLit = true; break; }
-                if (cs < ce && ce <= input.size() && inLit) {
-                    const bool lw = cs > 0 && IsWordByte((unsigned char)input[cs-1]);
-                    const bool rw = ce < input.size() && IsWordByte((unsigned char)input[ce]);
-                    if (lw || rw) ++dropped;
-                    else toks.push_back({cs, std::string(ts_node_type(n)) + "='" + input.substr(cs, ce-cs) + "'"});
+        if (sdblQuery) {
+            TSQueryCursor* cur = ts_query_cursor_new();
+            ts_query_cursor_exec(cur, sdblQuery, sroot);
+            TSQueryMatch m;
+            while (ts_query_cursor_next_match(cur, &m)) {
+                for (uint16_t i = 0; i < m.capture_count; ++i) {
+                    const TSQueryCapture& cap = m.captures[i];
+                    uint32_t cs = ts_node_start_byte(cap.node), ce = ts_node_end_byte(cap.node);
+                    if (cs >= ce || ce > input.size()) continue;
+                    bool inLit = false;
+                    for (auto& sp2 : spans) if (cs >= sp2.first && ce <= sp2.second) { inLit = true; break; }
+                    if (!inLit) continue;
+                    const bool lSlice = cs > 0 && IsWordByte((unsigned char)input[cs]) && IsWordByte((unsigned char)input[cs-1]);
+                    const bool rSlice = ce < input.size() && IsWordByte((unsigned char)input[ce-1]) && IsWordByte((unsigned char)input[ce]);
+                    if (lSlice || rSlice) { ++dropped; continue; }
+                    uint32_t nl = 0; const char* nm = ts_query_capture_name_for_id(sdblQuery, cap.index, &nl);
+                    int st = MapQueryCapture(std::string(nm, nl).c_str(), ts_node_type(cap.node));
+                    toks.push_back({cs, std::string(QueryStyleName(st)) + "='" + input.substr(cs, ce-cs) + "'"});
                 }
             }
-            uint32_t cc = ts_node_child_count(n);
-            for (uint32_t i = 0; i < cc; ++i) stk.push_back(ts_node_child(n, i));
+            ts_query_cursor_delete(cur);
+        } else {
+            std::vector<TSNode> stk{sroot};
+            while (!stk.empty()) {
+                TSNode n = stk.back(); stk.pop_back();
+                if (ts_node_child_count(n) == 0 && ts_node_is_named(n)) {
+                    uint32_t cs = ts_node_start_byte(n), ce = ts_node_end_byte(n);
+                    bool inLit = false;
+                    for (auto& sp2 : spans) if (cs >= sp2.first && ce <= sp2.second) { inLit = true; break; }
+                    if (cs < ce && ce <= input.size() && inLit) {
+                        const bool lw = cs > 0 && IsWordByte((unsigned char)input[cs-1]);
+                        const bool rw = ce < input.size() && IsWordByte((unsigned char)input[ce]);
+                        if (lw || rw) ++dropped;
+                        else toks.push_back({cs, std::string(ts_node_type(n)) + "='" + input.substr(cs, ce-cs) + "'"});
+                    }
+                }
+                uint32_t cc = ts_node_child_count(n);
+                for (uint32_t i = 0; i < cc; ++i) stk.push_back(ts_node_child(n, i));
+            }
         }
         std::sort(toks.begin(), toks.end());
         std::string line = "         tokens: ";
-        for (size_t i = 0; i < toks.size() && i < 16; ++i) line += toks[i].second + " ";
+        for (size_t i = 0; i < toks.size() && i < 60; ++i) line += toks[i].second + " ";
         if (dropped) line += ("  [dropped " + std::to_string(dropped) + " word-slice]");
         std::printf("%s\n", line.c_str());
         ts_tree_delete(st);

@@ -33,6 +33,18 @@ const TSStyleInfo kStyleInfo[TSStyle::Count] = {
     { "constant",     "SCE_TS_CONSTANT",     "Constant"               },
     { "punctuation",  "SCE_TS_PUNCTUATION",  "Punctuation"            },
     { "tag",          "SCE_TS_TAG",          "Tag (HTML/XML)"         },
+    // Query-fragment styles (SDBL inside BSL strings). Shown in Style Configurator.
+    { "QUERY KEYWORD",     "SCE_TS_Q_KEYWORD",     "Query keyword"          },
+    { "QUERY IDENTIFIER",  "SCE_TS_Q_IDENTIFIER",  "Query identifier / field" },
+    { "QUERY STRING",      "SCE_TS_Q_STRING",      "Query string literal"   },
+    { "QUERY NUMBER",      "SCE_TS_Q_NUMBER",      "Query number literal"   },
+    { "QUERY DATE",        "SCE_TS_Q_DATE",        "Query date/period literal" },
+    { "QUERY OPERATOR",    "SCE_TS_Q_OPERATOR",    "Query operator"         },
+    { "QUERY FUNCTION",    "SCE_TS_Q_FUNCTION",    "Query function / aggregate" },
+    { "QUERY TYPE",        "SCE_TS_Q_TYPE",        "Query type keyword"     },
+    { "QUERY CONSTANT",    "SCE_TS_Q_CONSTANT",    "Query constant (Истина/Ложь/…) " },
+    { "QUERY PARAMETER",   "SCE_TS_Q_PARAMETER",   "Query parameter (&…)"   },
+    { "QUERY PUNCTUATION", "SCE_TS_Q_PUNCTUATION", "Query punctuation"      },
 };
 
 // ============================================================================
@@ -591,9 +603,32 @@ bool IsWordByte(unsigned char c)
            (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;  // ASCII word or any UTF-8 lead/continuation
 }
 
+// Map an SDBL capture (plus its node type) to the dedicated Query* styles, so a
+// query never reuses the host BSL code colors. `nodeType` is needed because the
+// SDBL query uses @constant.builtin both for real constants (Истина/Ложь/…) and
+// for &parameters; the node type tells them apart.
+char MapQueryCapture(const std::string& capture, const char* nodeType)
+{
+    auto is = [&](const char* n) { return nodeType && std::strcmp(nodeType, n) == 0; };
+    if (capture == "constant.builtin" && is("parameter"))
+        return TSStyle::QueryParameter;
+    if (capture == "comment") return TSStyle::Comment;  // rare inside a query
+    if (capture.rfind("keyword", 0) == 0) return TSStyle::QueryKeyword;
+    if (capture.rfind("type", 0) == 0) return TSStyle::QueryType;
+    if (capture.rfind("constant", 0) == 0)
+        return (is("date") || is("date_time_literal")) ? TSStyle::QueryDate : TSStyle::QueryConstant;
+    if (capture.rfind("variable", 0) == 0) return TSStyle::QueryIdentifier;
+    if (capture.rfind("function", 0) == 0 || capture.rfind("method", 0) == 0)
+        return TSStyle::QueryFunction;
+    if (capture.rfind("operator", 0) == 0) return TSStyle::QueryOperator;
+    if (capture.rfind("punctuation", 0) == 0) return TSStyle::QueryPunctuation;
+    if (capture.rfind("number", 0) == 0 || capture == "float") return TSStyle::QueryNumber;
+    if (capture.rfind("string", 0) == 0 || capture == "character") return TSStyle::QueryString;
+    return TSStyle::QueryIdentifier;
+}
+
 void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>& literalSpans,
                            uint32_t base, const TreeSitterGrammar* sdblGrammar,
-                           const TreeSitterStyleMap& styleMap,
                            std::vector<LexHighlight>& highlights)
 {
     TSParser* parser = ts_parser_new();
@@ -623,17 +658,28 @@ void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>
                     }
                     if (!inLiteral)
                         continue;
-                    // Skip captures that are only a slice of a longer word.
-                    const bool leftWord = cs > 0 &&
+                    // Skip captures that are only a slice of a longer word: both
+                    // the capture's own boundary byte AND its neighbour must be
+                    // word bytes. (A capture ending in "(" followed by a word, as
+                    // the SDBL aggregate name does, is not a slice.)
+                    const bool leftSlice = cs > 0 &&
+                        IsWordByte(static_cast<unsigned char>(input[cs])) &&
                         IsWordByte(static_cast<unsigned char>(input[cs - 1]));
-                    const bool rightWord = ce < input.size() &&
+                    const bool rightSlice = ce < input.size() &&
+                        IsWordByte(static_cast<unsigned char>(input[ce - 1])) &&
                         IsWordByte(static_cast<unsigned char>(input[ce]));
-                    if (leftWord || rightWord)
+                    if (leftSlice || rightSlice)
                         continue;
                     uint32_t nameLen = 0;
                     const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
-                    const char style = styleMap.MapCapture(std::string(name, nameLen));
-                    highlights.push_back({base + cs, base + ce, style, UINT32_MAX});
+                    const char style = MapQueryCapture(std::string(name, nameLen),
+                                                       ts_node_type(cap.node));
+                    // Same-start overlaps: keywords/functions/… must win over the
+                    // generic identifier capture (e.g. ЕСТЬNULL is both a function
+                    // and a @variable). Keep query highlights on top of the host
+                    // BSL highlights (large pattern = painted later = wins).
+                    const uint32_t prio = (style == TSStyle::QueryIdentifier) ? 1000000u : 1000001u;
+                    highlights.push_back({base + cs, base + ce, style, prio});
                 }
             }
             ts_query_cursor_delete(cursor);
@@ -714,7 +760,6 @@ void FlattenConcat(const char* docText, TSNode expr, std::vector<TSNode>& out)
 // parser keeps its bearings while their positions are skipped on projection).
 void HandleConcatGroup(const char* docText, uint32_t docLen, TSNode group,
                        const qf::QueryFragmentScorer& scorer, const TreeSitterGrammar* sdbl,
-                       const TreeSitterStyleMap& styleMap,
                        std::vector<LexHighlight>& highlights)
 {
     std::vector<TSNode> operands;
@@ -763,14 +808,13 @@ void HandleConcatGroup(const char* docText, uint32_t docLen, TSNode group,
             combined[s] = 'X';  // neutral identifier / value placeholder
     }
 
-    AddFragmentHighlights(combined, literalSpans, groupStart, sdbl, styleMap, highlights);
+    AddFragmentHighlights(combined, literalSpans, groupStart, sdbl, highlights);
 }
 
 // Walk the (pruned) tree for string literals and string concatenations, score
 // them, and colorize the ones that look like query fragments.
 void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
                                 TSNode rootNode, uint32_t startPos, uint32_t endPos,
-                                const TreeSitterStyleMap& styleMap,
                                 std::vector<LexHighlight>& highlights)
 {
     TreeSitterRegistry& registry = TreeSitterRegistry::Instance();
@@ -797,7 +841,7 @@ void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
                 const std::string input = MakeSdblInput(docText + ns, ne - ns);
                 if (scorer.Score(input).score >= scorer.Threshold())
                     AddFragmentHighlights(input, {{0, static_cast<uint32_t>(input.size())}},
-                                          ns, sdbl, styleMap, highlights);
+                                          ns, sdbl, highlights);
             }
             continue;  // strings do not nest - no need to descend
         }
@@ -807,7 +851,7 @@ void AddQueryFragmentHighlights(const char* docText, uint32_t docLen,
             // here because we never descend into a handled group.
             const TSNode parent = ts_node_parent(node);
             if (ts_node_is_null(parent) || !IsPlusBinaryExpression(docText, parent)) {
-                HandleConcatGroup(docText, docLen, node, scorer, sdbl, styleMap, highlights);
+                HandleConcatGroup(docText, docLen, node, scorer, sdbl, highlights);
                 continue;  // do not descend: its strings are handled as a group
             }
             continue;
@@ -1285,7 +1329,7 @@ void SCI_METHOD TreeSitterILexer::Lex(Sci_PositionU startPos, Sci_Position lengt
         AddQueryFragmentHighlights(docText, static_cast<uint32_t>(docLen), rootNode,
                                    static_cast<uint32_t>(startPos),
                                    static_cast<uint32_t>(endPos),
-                                   m_styleMap, highlights);
+                                   highlights);
     }
 
     // ---------------------------------------------------------------
