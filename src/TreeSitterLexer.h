@@ -61,7 +61,7 @@ namespace TSStyle {
         QueryIdentifier   = 15,
         QueryString       = 16,
         QueryNumber       = 17,
-        QueryDate         = 18,
+        QueryAggregate    = 18,   // СУММА(/КОЛИЧЕСТВО(/СРЕДНЕЕ(/МИНИМУМ(/МАКСИМУМ(
         QueryOperator     = 19,
         QueryFunction     = 20,
         QueryType         = 21,

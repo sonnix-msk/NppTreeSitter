@@ -38,7 +38,7 @@ const TSStyleInfo kStyleInfo[TSStyle::Count] = {
     { "QUERY IDENTIFIER",  "SCE_TS_Q_IDENTIFIER",  "Query identifier / field" },
     { "QUERY STRING",      "SCE_TS_Q_STRING",      "Query string literal"   },
     { "QUERY NUMBER",      "SCE_TS_Q_NUMBER",      "Query number literal"   },
-    { "QUERY DATE",        "SCE_TS_Q_DATE",        "Query date/period literal" },
+    { "QUERY AGGREGATE",   "SCE_TS_Q_AGGREGATE",   "Query aggregate fn (СУММА/…)" },
     { "QUERY OPERATOR",    "SCE_TS_Q_OPERATOR",    "Query operator"         },
     { "QUERY FUNCTION",    "SCE_TS_Q_FUNCTION",    "Query function / aggregate" },
     { "QUERY TYPE",        "SCE_TS_Q_TYPE",        "Query type keyword"     },
@@ -606,17 +606,25 @@ bool IsWordByte(unsigned char c)
 // Map an SDBL capture (plus its node type) to the dedicated Query* styles, so a
 // query never reuses the host BSL code colors. `nodeType` is needed because the
 // SDBL query uses @constant.builtin both for real constants (Истина/Ложь/…) and
-// for &parameters; the node type tells them apart.
-char MapQueryCapture(const std::string& capture, const char* nodeType)
+// for &parameters; the node type tells them apart. Returns -1 to skip the capture.
+int MapQueryCapture(const std::string& capture, const char* nodeType)
 {
     auto is = [&](const char* n) { return nodeType && std::strcmp(nodeType, n) == 0; };
+    // Aggregate functions (СУММА/КОЛИЧЕСТВО/СРЕДНЕЕ/МИНИМУМ/МАКСИМУМ) are their
+    // own class; the grammar captures the whole "сумма(" token as this node type.
+    if (is("aggregate_function_name")) return TSStyle::QueryAggregate;
+    // ДАТАВРЕМЯ(...) is captured as a whole @constant literal, but it reads as a
+    // call: skip it so its parts get finer styles (ДАТАВРЕМЯ -> function below,
+    // the numbers -> numbers).
+    if (capture.rfind("constant", 0) == 0 && is("date_time_literal")) return -1;
+    // ПУСТАЯТАБЛИЦА.( … ) is a table constructor, not a plain keyword.
+    if (is("EMPTY_TABLE_KEYWORD")) return TSStyle::QueryFunction;
     if (capture == "constant.builtin" && is("parameter"))
         return TSStyle::QueryParameter;
     if (capture == "comment") return TSStyle::Comment;  // rare inside a query
     if (capture.rfind("keyword", 0) == 0) return TSStyle::QueryKeyword;
     if (capture.rfind("type", 0) == 0) return TSStyle::QueryType;
-    if (capture.rfind("constant", 0) == 0)
-        return (is("date") || is("date_time_literal")) ? TSStyle::QueryDate : TSStyle::QueryConstant;
+    if (capture.rfind("constant", 0) == 0) return TSStyle::QueryConstant;
     if (capture.rfind("variable", 0) == 0) return TSStyle::QueryIdentifier;
     if (capture.rfind("function", 0) == 0 || capture.rfind("method", 0) == 0)
         return TSStyle::QueryFunction;
@@ -625,6 +633,17 @@ char MapQueryCapture(const std::string& capture, const char* nodeType)
     if (capture.rfind("number", 0) == 0 || capture == "float") return TSStyle::QueryNumber;
     if (capture.rfind("string", 0) == 0 || capture == "character") return TSStyle::QueryString;
     return TSStyle::QueryIdentifier;
+}
+
+// True if the next non-blank byte after `pos` is '('. This is the rule that
+// classifies call-like words as functions: ДАТАВРЕМЯ(, ТИП(, ЗНАЧЕНИЕ(,
+// ЕСТЬNULL(, ПРЕДСТАВЛЕНИЕ( and any other name followed by a bracket - no need to
+// enumerate them.
+bool FollowedByOpenParen(const std::string& input, size_t pos)
+{
+    while (pos < input.size() && (input[pos] == ' ' || input[pos] == '\t'))
+        ++pos;
+    return pos < input.size() && input[pos] == '(';
 }
 
 void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>& literalSpans,
@@ -672,14 +691,24 @@ void AddFragmentHighlights(const std::string& input, const std::vector<ByteSpan>
                         continue;
                     uint32_t nameLen = 0;
                     const char* name = ts_query_capture_name_for_id(query, cap.index, &nameLen);
-                    const char style = MapQueryCapture(std::string(name, nameLen),
-                                                       ts_node_type(cap.node));
+                    int style = MapQueryCapture(std::string(name, nameLen),
+                                                ts_node_type(cap.node));
+                    if (style < 0)
+                        continue;  // capture intentionally skipped
+                    // Bracket rule: a keyword/type/identifier immediately followed
+                    // by '(' is a call-like word rendered as a function
+                    // (ДАТАВРЕМЯ(, ТИП(, ЗНАЧЕНИЕ(, ПРЕДСТАВЛЕНИЕ(, …). Constants
+                    // and numbers are excluded (Истина isn't a call).
+                    if ((style == TSStyle::QueryKeyword || style == TSStyle::QueryType ||
+                         style == TSStyle::QueryIdentifier) &&
+                        FollowedByOpenParen(input, ce))
+                        style = TSStyle::QueryFunction;
                     // Same-start overlaps: keywords/functions/… must win over the
                     // generic identifier capture (e.g. ЕСТЬNULL is both a function
                     // and a @variable). Keep query highlights on top of the host
                     // BSL highlights (large pattern = painted later = wins).
                     const uint32_t prio = (style == TSStyle::QueryIdentifier) ? 1000000u : 1000001u;
-                    highlights.push_back({base + cs, base + ce, style, prio});
+                    highlights.push_back({base + cs, base + ce, static_cast<char>(style), prio});
                 }
             }
             ts_query_cursor_delete(cursor);

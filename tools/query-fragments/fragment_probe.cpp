@@ -74,7 +74,7 @@ static const char* QueryStyleName(int id) {
         case 15: return "Q_IDENT";
         case 16: return "Q_STRING";
         case 17: return "Q_NUMBER";
-        case 18: return "Q_DATE";
+        case 18: return "Q_AGG";
         case 19: return "Q_OPER";
         case 20: return "Q_FUNC";
         case 21: return "Q_TYPE";
@@ -85,14 +85,17 @@ static const char* QueryStyleName(int id) {
     }
 }
 
-// Копия MapQueryCapture из плагина (для объективной проверки).
+// Копия MapQueryCapture из плагина (для объективной проверки). -1 = пропустить.
 static int MapQueryCapture(const char* capture, const char* nodeType) {
     auto is = [&](const char* n) { return nodeType && std::strcmp(nodeType, n) == 0; };
+    if (is("aggregate_function_name")) return 18;
+    if (std::strncmp(capture, "constant", 8) == 0 && is("date_time_literal")) return -1;
+    if (is("EMPTY_TABLE_KEYWORD")) return 20;
     if (std::strcmp(capture, "constant.builtin") == 0 && is("parameter")) return 23;
     if (std::strcmp(capture, "comment") == 0) return 3;
     if (std::strncmp(capture, "keyword", 7) == 0) return 14;
     if (std::strncmp(capture, "type", 4) == 0) return 21;
-    if (std::strncmp(capture, "constant", 8) == 0) return (is("date") || is("date_time_literal")) ? 18 : 22;
+    if (std::strncmp(capture, "constant", 8) == 0) return 22;
     if (std::strncmp(capture, "variable", 8) == 0) return 15;
     if (std::strncmp(capture, "function", 8) == 0 || std::strncmp(capture, "method", 6) == 0) return 20;
     if (std::strncmp(capture, "operator", 8) == 0) return 19;
@@ -100,6 +103,11 @@ static int MapQueryCapture(const char* capture, const char* nodeType) {
     if (std::strncmp(capture, "number", 6) == 0 || std::strcmp(capture, "float") == 0) return 17;
     if (std::strncmp(capture, "string", 6) == 0 || std::strcmp(capture, "character") == 0) return 16;
     return 15;
+}
+
+static bool FollowedByOpenParen(const std::string& s, size_t pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
+    return pos < s.size() && s[pos] == '(';
 }
 
 int main(int argc, char** argv) {
@@ -165,6 +173,8 @@ int main(int argc, char** argv) {
                     if (lSlice || rSlice) { ++dropped; continue; }
                     uint32_t nl = 0; const char* nm = ts_query_capture_name_for_id(sdblQuery, cap.index, &nl);
                     int st = MapQueryCapture(std::string(nm, nl).c_str(), ts_node_type(cap.node));
+                    if (st < 0) continue;
+                    if ((st == 14 || st == 21 || st == 15) && FollowedByOpenParen(input, ce)) st = 20;
                     toks.push_back({cs, std::string(QueryStyleName(st)) + "='" + input.substr(cs, ce-cs) + "'"});
                 }
             }
