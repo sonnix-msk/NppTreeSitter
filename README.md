@@ -1,5 +1,10 @@
 # NppTreeSitter
 
+> **Unofficial fork.** This is `sonnix-msk/NppTreeSitter`, an unofficial build of
+> [Thorium/NppTreeSitter](https://github.com/Thorium/NppTreeSitter) with local fixes and
+> 1C:Enterprise (BSL / SDBL) support — not affiliated with or endorsed by upstream.
+> See [FORK-NOTICE.md](FORK-NOTICE.md) for the changes and licensing.
+
 A [Notepad++](https://notepad-plus-plus.org/) plugin that provides syntax highlighting and code folding powered by [tree-sitter](https://tree-sitter.github.io/) grammars.
 
 From the Notepad++ menu:
